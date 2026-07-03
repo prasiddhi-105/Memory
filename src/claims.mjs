@@ -96,3 +96,66 @@ export function claimsForEvidence(evidenceId, claims = []) {
       claim.contradicted_by_evidence_ids.includes(id)
     );
 }
+// In-memory registry to track quarantined claims and their reporting applications
+const QUARANTINE_REGISTRY = new Map();
+
+// High-sensitivity scopes that require multi-app verification
+const SENSITIVE_SCOPES = new Set(["health"]);
+
+/**
+ * Verifies high-sensitivity claims by requiring independent application sources.
+ * Keeps sensitive claims quarantined until at least two unique apps contribute matching signals.
+ * 
+ * @param {Object} claimResult - An object returned by createClaim() containing { ok, claim, errors }
+ * @param {string} sourceApp - The identifier/name of the application reporting the claim
+ * @returns {Object} An object indicating verification status: { verified: boolean, quarantined: boolean, claim: Object|null }
+ */
+export function verifyAndProcessClaim(claimResult, sourceApp) {
+  if (!claimResult || !claimResult.ok || !claimResult.claim) {
+    return { verified: false, quarantined: false, claim: null };
+  }
+
+  const claim = claimResult.claim;
+  const category = claim.metadata?.category || claim.category;
+  const appName = normalize(sourceApp).toLowerCase();
+
+  // If the claim is not inside a sensitive scope, it bypasses verification completely
+  if (!category || !SENSITIVE_SCOPES.has(category.toLowerCase())) {
+    return { verified: true, quarantined: false, claim };
+  }
+
+  // If no application source is provided, it cannot be verified
+  if (!appName) {
+    return { verified: false, quarantined: true, claim: null };
+  }
+
+  const claimId = claim.claim_id;
+
+  if (!QUARANTINE_REGISTRY.has(claimId)) {
+    // First time seeing this sensitive claim: Quarantine it and record the app
+    QUARANTINE_REGISTRY.set(claimId, {
+      claim,
+      sources: new Set([appName])
+    });
+    return { verified: false, quarantined: true, claim: null };
+  }
+
+  const quarantineEntry = QUARANTINE_REGISTRY.get(claimId);
+  quarantineEntry.sources.add(appName);
+
+  // Check if we have at least two independent application sources
+  if (quarantineEntry.sources.size >= 2) {
+    // Released from quarantine!
+    return { verified: true, quarantined: false, claim: quarantineEntry.claim };
+  }
+
+  // Still quarantined (matching signal but from the same application)
+  return { verified: false, quarantined: true, claim: null };
+}
+
+/**
+ * Helper to clear the quarantine cache between test sweeps.
+ */
+export function clearQuarantineRegistry() {
+  QUARANTINE_REGISTRY.clear();
+}
