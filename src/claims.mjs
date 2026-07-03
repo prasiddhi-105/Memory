@@ -96,3 +96,50 @@ export function claimsForEvidence(evidenceId, claims = []) {
       claim.contradicted_by_evidence_ids.includes(id)
     );
 }
+// In-memory inverted index registry mapping category keys to arrays of matching claims
+const CATEGORY_INVERTED_INDEX = new Map();
+
+/**
+ * Parses and indexes an array of claims into the high-performance inverted index registry.
+ * @param {Array<Object>} claims - Collection of valid memory claims
+ */
+export function buildCategoryIndex(claims = []) {
+  // Clear any existing index data to prevent stale lookups across re-indexes
+  CATEGORY_INVERTED_INDEX.clear();
+
+  if (!Array.isArray(claims)) return;
+
+  claims.forEach((claim) => {
+    if (!claim) return;
+    
+    // Extract category dynamically from top-level or metadata groupings
+    const rawCategory = claim.category || claim.metadata?.category;
+    if (!rawCategory) return;
+
+    const normalizedCategory = String(rawCategory).toLowerCase().trim();
+
+    if (!CATEGORY_INVERTED_INDEX.has(normalizedCategory)) {
+      CATEGORY_INVERTED_INDEX.set(normalizedCategory, []);
+    }
+
+    CATEGORY_INVERTED_INDEX.get(normalizedCategory).push(claim);
+  });
+}
+
+/**
+ * Performs an O(1) optimized lookup to instantly retrieve all claims matching a given category.
+ * @param {string} category - The category to query
+ * @returns {Array<Object>} List of matched claims (empty array if no matches found)
+ */
+export function getClaimsByCategory(category) {
+  if (!category) return [];
+  const normalizedKey = String(category).toLowerCase().trim();
+  return CATEGORY_INVERTED_INDEX.get(normalizedKey) || [];
+}
+
+/**
+ * Flushes the active lookup cache index state.
+ */
+export function clearCategoryIndex() {
+  CATEGORY_INVERTED_INDEX.clear();
+}
