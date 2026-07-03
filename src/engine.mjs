@@ -1502,3 +1502,44 @@ function isSchemaMemory(memory) {
 function isIntentMemory(memory) {
   return memory?.type === "intent_memory";
 }
+
+// Append-only commit log storage array
+let COMMIT_JOURNAL_LOG = [];
+
+// Maximum number of entries to retain before triggering rotation truncation
+const MAX_LOG_THRESHOLD = 50;
+
+/**
+ * Appends an entry to the journal log and automatically truncates old rows
+ * if the total length violates our maximum boundary size.
+ * * @param {Object|string} entry - The log event metadata or text string to commit
+ * @returns {Array<Object|string>} The updated, bounded journal log array
+ */
+export function appendCommitLog(entry) {
+  if (entry === undefined || entry === null) return COMMIT_JOURNAL_LOG;
+
+  // Append new log entry to the end of our journal track
+  COMMIT_JOURNAL_LOG.push(entry);
+
+  // If the log exceeds bounds, truncate older rows out of the array
+  if (COMMIT_JOURNAL_LOG.length > MAX_LOG_THRESHOLD) {
+    COMMIT_JOURNAL_LOG = COMMIT_JOURNAL_LOG.slice(-MAX_LOG_THRESHOLD);
+  }
+
+  return COMMIT_JOURNAL_LOG;
+}
+
+/**
+ * Retrieves the current state of the commit journal log array.
+ * @returns {Array<Object|string>}
+ */
+export function getCommitJournal() {
+  return COMMIT_JOURNAL_LOG;
+}
+
+/**
+ * Resets the journal log state between validation sweeps.
+ */
+export function clearCommitJournal() {
+  COMMIT_JOURNAL_LOG = [];
+}
