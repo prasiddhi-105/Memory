@@ -1,19 +1,3 @@
-// Centralized category decay parameters registry
-const CATEGORY_DECAY_REGISTRY = {
-  "news-reading": 0.15,
-  "news": 0.15,
-  "shopping": 0.08,
-  "learning": 0.02,
-  "research": 0.02,
-  "productivity": 0.04,
-  "developer_work": 0.03,
-  "general": 0.05,
-  "health": 0.005, // Near-zero decay rate for high-stability context
-};
-
-const DEFAULT_DECAY_COEFFICIENT = 0.05;
-const DECAY_ELIMINATION_THRESHOLD = 0.15; // Prune memories completely if confidence drops below this
-
 import { resolveSchemaLifecycleState, schemaLifecycleLabel } from "./lifecycle.mjs";
 import { buildProductivityAttributes, inferProductivitySubSchema } from "./categories/productivity.mjs";
 export { buildMissingContextFields, contextGoalTemplates, groupContextEntry, suggestContextGoal } from "./context-goals.mjs";
@@ -715,7 +699,6 @@ function inferRecordCategory(record = {}) {
   if (/assistant|chat/.test(text)) return "ai_assistant_usage"
   if (/\b(productivity|task|tasks|work|doc|docs)\b/.test(text)) return "productivity"
   if (/fitness|workout|nutrition|diet|exercise/.test(text)) return "fitness"
-  if (/health|medical|allergy|diagnosis/.test(text)) return "health" // ◄ ADD THIS LINE
   if (/prefer|like|choice/.test(text)) return "preferences"
   return "general"
 }
@@ -1102,18 +1085,28 @@ function slug(value) {
     .replace(/[^a-z0-9]+/g, "-")
     .replace(/^-+|-+$/g, "") || "schema";
 }
+// Centralized category decay parameters registry
+const CATEGORY_DECAY_REGISTRY = {
+  "news-reading": 0.15,
+  "news": 0.15,
+  "shopping": 0.08,
+  "learning": 0.02,
+  "research": 0.02,
+  "productivity": 0.04,
+  "developer_work": 0.03,
+  "general": 0.05,
+  "health": 0.005, 
+};
+
+const DEFAULT_DECAY_COEFFICIENT = 0.05;
+const DECAY_ELIMINATION_THRESHOLD = 0.15;
+
 /**
  * Executes a memory pruning pass by applying category-specific decay coefficients.
- * Highly volatile categories (like news) decay rapidly, while stable schemas persist.
- * * @param {Array} records - Array of induced schemas or memory packets to process.
- * @returns {Array} The remaining active memories after decay and pruning.
  */
-/**
- * Executes a memory pruning pass by applying category-specific decay coefficients.
- */
-export function decayMemories(records = []) { // ◄ MAKE SURE "export" IS HERE!
+export function decayMemories(records = []) {
   if (!Array.isArray(records)) return [];
-  
+
   return records
     .map(record => {
       let recordCategory = record.category;
