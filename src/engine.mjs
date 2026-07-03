@@ -1,406 +1,830 @@
-export const MEMORY_SCHEMA_VERSION = "memact.memory.v0";
-const DEFAULT_RETENTION_THRESHOLD = 0.34;
-const DEFAULT_DECAY_PER_DAY = 0.006;
-const MAX_SOURCES = 8;
-const DEFAULT_RAG_TOP = 6;
+// Centralized category decay parameters registry
+const CATEGORY_DECAY_REGISTRY = {
+  "news-reading": 0.15,
+  "news": 0.15,
+  "shopping": 0.08,
+  "learning": 0.02,
+  "research": 0.02,
+  "productivity": 0.04,
+  "developer_work": 0.03,
+  "general": 0.05,
+  "health": 0.005, // Near-zero decay rate for high-stability context
+};
 
-export const MEMORY_RELATION_TYPES = Object.freeze({
-  ASSIMILATES: "assimilates",
-  ACCOMMODATES: "accommodates",
-  REINFORCES: "reinforces",
-  WEAKENS: "weakens",
-  CONTRADICTS: "contradicts",
-  TRIGGERS: "triggers",
-  BUILDS_ON: "builds_on",
-  SUPPORTS: "supports",
-  UPDATES: "updates",
-  SUPERSEDES: "supersedes",
-  SUPERSEDED_BY: "superseded_by",
-  CO_OCCURS_WITH: "co_occurs_with",
-  EVIDENCED_BY: "evidenced_by",
-  RELATED: "related",
-});
+const DEFAULT_DECAY_COEFFICIENT = 0.05;
+const DECAY_ELIMINATION_THRESHOLD = 0.15; // Prune memories completely if confidence drops below this
 
-const RELATION_METADATA = Object.freeze({
-  [MEMORY_RELATION_TYPES.ASSIMILATES]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.74 },
-  [MEMORY_RELATION_TYPES.ACCOMMODATES]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.72 },
-  [MEMORY_RELATION_TYPES.REINFORCES]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.7 },
-  [MEMORY_RELATION_TYPES.WEAKENS]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.45 },
-  [MEMORY_RELATION_TYPES.CONTRADICTS]: { category: "schema_lifecycle", directed: false, defaultWeight: 0.68 },
-  [MEMORY_RELATION_TYPES.TRIGGERS]: { category: "influence", directed: true, defaultWeight: 0.62 },
-  [MEMORY_RELATION_TYPES.BUILDS_ON]: { category: "learning", directed: true, defaultWeight: 0.64 },
-  [MEMORY_RELATION_TYPES.SUPPORTS]: { category: "evidence", directed: true, defaultWeight: 0.72 },
-  [MEMORY_RELATION_TYPES.UPDATES]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.66 },
-  [MEMORY_RELATION_TYPES.SUPERSEDES]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.82 },
-  [MEMORY_RELATION_TYPES.SUPERSEDED_BY]: { category: "schema_lifecycle", directed: true, defaultWeight: 0.82 },
-  [MEMORY_RELATION_TYPES.CO_OCCURS_WITH]: { category: "association", directed: false, defaultWeight: 0.52 },
-  [MEMORY_RELATION_TYPES.EVIDENCED_BY]: { category: "evidence", directed: true, defaultWeight: 0.78 },
-  [MEMORY_RELATION_TYPES.RELATED]: { category: "association", directed: false, defaultWeight: 0.5 },
-});
+import { resolveSchemaLifecycleState, schemaLifecycleLabel } from "./lifecycle.mjs";
+import { buildProductivityAttributes, inferProductivitySubSchema } from "./categories/productivity.mjs";
+export { buildMissingContextFields, contextGoalTemplates, groupContextEntry, suggestContextGoal } from "./context-goals.mjs";
+export { LocalContextMatcher, SemanticContextMatcher, createContextMatcher, matchContextFields } from "./context-matcher.mjs";
 
-function normalize(value, maxLength = 0) {
-  const text = String(value || "").replace(/\s+/g, " ").trim();
-  if (!text) return "";
-  if (maxLength && text.length > maxLength) {
-    return `${text.slice(0, maxLength - 3).trim()}...`;
-  }
-  return text;
-}
+const DEFAULT_MIN_SUPPORT = 3;
+const DEFAULT_MIN_MEANINGFUL_SCORE = 0.38;
+const DEFAULT_MIN_WEIGHTED_SUPPORT = 1.15;
+const DEFAULT_MIN_COHESION = 0.05;
+const DEFAULT_MAX_SCHEMAS = 8;
 
-function slug(value) {
-  return normalize(value, 180)
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-+|-+$/g, "") || "memory";
-}
+const STOP_WORDS = new Set([
+  "about",
+  "after",
+  "again",
+  "also",
+  "and",
+  "are",
+  "before",
+  "being",
+  "can",
+  "com",
+  "did",
+  "does",
+  "for",
+  "from",
+  "has",
+  "have",
+  "how",
+  "into",
+  "just",
+  "like",
+  "not",
+  "now",
+  "off",
+  "once",
+  "only",
+  "page",
+  "that",
+  "the",
+  "then",
+  "this",
+  "through",
+  "toward",
+  "was",
+  "were",
+  "what",
+  "when",
+  "where",
+  "while",
+  "with",
+  "your",
+]);
 
-function unique(values = []) {
-  return [...new Set((Array.isArray(values) ? values : []).map((value) => normalize(value)).filter(Boolean))];
-}
+const LOW_SIGNAL_TERMS = new Set([
+  "account",
+  "admin",
+  "billing",
+  "dashboard",
+  "example",
+  "home",
+  "login",
+  "meaningful",
+  "page",
+  "privacy",
+  "profile",
+  "settings",
+  "signin",
+  "signup",
+  "source",
+  "specific",
+  "repeated",
+  "activity",
+]);
 
-function clamp(value, min = 0, max = 1) {
-  const number = Number(value || 0);
-  return Math.max(min, Math.min(max, Number(number.toFixed(4))));
-}
+const MUSIC_FIELD_SPECS = [
+  { output: "favorite_genres", aliases: ["favorite_genres", "preferred_genres", "liked_genres", "genres"] },
+  { output: "disliked_genres", aliases: ["disliked_genres", "skipped_genres", "blocked_genres"] },
+  { output: "frequent_artists", aliases: ["frequent_artists", "repeated_artists", "favorite_artists", "artists"] },
+  { output: "skipped_artists", aliases: ["skipped_artists", "blocked_artists", "ignored_artists"] },
+  { output: "playlist_themes", aliases: ["playlist_themes", "playlist_theme", "mix_theme"] },
+  { output: "listening_moods", aliases: ["listening_moods", "mood_tags", "listening_mood"] },
+  { output: "discovery_preferences", aliases: ["discovery_preferences", "discovery_mode", "new_music_preference"] },
+  { output: "explicit_preferences", aliases: ["explicit_preferences", "direct_preferences", "user_preferences"] },
+];
 
-function nowIso() {
-  return new Date().toISOString();
-}
+const MUSIC_SENSITIVE_KEYS = new Set([
+  "inferred_mood",
+  "mood_inference",
+  "mental_health",
+  "health_condition",
+  "diagnosis",
+  "religion",
+  "politics",
+  "sexuality",
+  "gender_identity",
+  "race",
+  "ethnicity",
+  "age",
+  "location",
+]);
 
-function relationId(fromId, toId, type) {
-  return `relation:${slug(fromId)}:${slug(type)}:${slug(toId)}`;
-}
+const COGNITIVE_DIMENSIONS = {
+  action: [
+    "apply",
+    "build",
+    "change",
+    "choose",
+    "create",
+    "debug",
+    "decide",
+    "finish",
+    "fix",
+    "launch",
+    "learn",
+    "make",
+    "plan",
+    "practice",
+    "prepare",
+    "prove",
+    "publish",
+    "ship",
+    "solve",
+    "start",
+    "work",
+  ],
+  evaluation: [
+    "accepted",
+    "behind",
+    "better",
+    "compare",
+    "deadline",
+    "fail",
+    "grade",
+    "judge",
+    "rank",
+    "ready",
+    "rejected",
+    "score",
+    "test",
+    "value",
+    "worth",
+  ],
+  identity: [
+    "become",
+    "career",
+    "confidence",
+    "founder",
+    "future",
+    "identity",
+    "life",
+    "myself",
+    "person",
+    "self",
+  ],
+  affect: [
+    "anxiety",
+    "burnout",
+    "feel",
+    "fear",
+    "focus",
+    "guilt",
+    "happy",
+    "obsessed",
+    "overwhelmed",
+    "pressure",
+    "stress",
+    "tired",
+  ],
+  social: [
+    "audience",
+    "followers",
+    "friends",
+    "likes",
+    "people",
+    "public",
+    "recognition",
+    "share",
+    "social",
+    "views",
+  ],
+};
 
-function normalizeRelationType(type) {
-  const normalized = normalize(type, 80).toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
-  return Object.values(MEMORY_RELATION_TYPES).includes(normalized) ? normalized : MEMORY_RELATION_TYPES.RELATED;
-}
+export function detectSchemas(inferenceOutput, options = {}) {
+  const minSupport = Number(options.minSupport ?? DEFAULT_MIN_SUPPORT);
+  const minimumMeaningfulScore = Number(options.minimumMeaningfulScore ?? DEFAULT_MIN_MEANINGFUL_SCORE);
+  const minWeightedSupport = Number(options.minWeightedSupport ?? DEFAULT_MIN_WEIGHTED_SUPPORT);
+  const minCohesion = Number(options.minCohesion ?? DEFAULT_MIN_COHESION);
+  const maxSchemas = Number(options.maxSchemas ?? DEFAULT_MAX_SCHEMAS);
+  const records = (Array.isArray(inferenceOutput?.records) ? inferenceOutput.records : [])
+    .filter((record) => record.meaningful !== false)
+    .filter((record) => Number(record.meaningful_score ?? 1) >= minimumMeaningfulScore)
+    .map(profileRecord);
 
-function normalizeRelationInput(input = {}) {
-  const from = normalize(input.from || input.from_id || input.source_id);
-  const to = normalize(input.to || input.to_id || input.target_id);
-  const type = normalizeRelationType(input.type || input.relation || MEMORY_RELATION_TYPES.RELATED);
-  const metadata = RELATION_METADATA[type] || RELATION_METADATA[MEMORY_RELATION_TYPES.RELATED];
-  const validFrom = normalize(input.valid_from || input.occurred_at || input.recorded_at || nowIso(), 80);
+  const themeCounts = countThemes(records);
+  const schemas = induceSchemas(records, {
+    minSupport,
+    minWeightedSupport,
+    minCohesion,
+    maxSchemas,
+  });
+
   return {
-    id: normalize(input.id) || relationId(from, to, type),
-    from,
-    to,
-    type,
-    category: normalize(input.category || metadata.category),
-    directed: input.directed ?? metadata.directed,
-    weight: clamp(input.weight ?? metadata.defaultWeight),
-    confidence: clamp(input.confidence ?? input.weight ?? metadata.defaultWeight),
-    evidence: {
-      reason: normalize(input.evidence?.reason || input.reason, 260),
-      sources: dedupeSources(input.evidence?.sources || input.sources || [], 4),
-      packet_ids: unique(input.evidence?.packet_ids || input.packet_ids),
+    schema_version: "memact.schema.v0",
+    generated_at: new Date().toISOString(),
+    source: {
+      inference_schema_version: inferenceOutput?.schema_version ?? null,
+      inferred_record_count: Array.isArray(inferenceOutput?.records) ? inferenceOutput.records.length : 0,
+      meaningful_record_count: records.length,
     },
-    valid_from: validFrom,
-    valid_until: normalize(input.valid_until, 80),
-    recorded_at: normalize(input.recorded_at || nowIso(), 80),
-    invalidated_by: normalize(input.invalidated_by),
+    formation_mode: "evidence_induced",
+    min_support: minSupport,
+    minimum_meaningful_score: minimumMeaningfulScore,
+    min_weighted_support: minWeightedSupport,
+    min_cohesion: minCohesion,
+    theme_counts: themeCounts,
+    schemas,
+    schema_network: buildSchemaNetwork(schemas),
+    formation_principle: "Virtual cognitive schemas are induced from repeated meaningful activity, co-occurring concepts, cognitive dimensions, source spread, and time. They are not selected from a fixed topic taxonomy.",
   };
 }
 
-function parseTime(value) {
-  const timestamp = Date.parse(value || "");
-  return Number.isFinite(timestamp) ? timestamp : 0;
+export function formSchemaPackets(records = [], options = {}) {
+  const groups = groupByCategory(records)
+  return Object.values(groups)
+    .map((group) => createSchemaPacket(group, options))
+    .filter((packet) => packet.confidence >= Number(options.minConfidence ?? 0.2))
 }
 
-function daysSince(value, now = Date.now()) {
-  const timestamp = parseTime(value);
-  if (!timestamp) return 0;
-  return Math.max(0, (now - timestamp) / 86400000);
+export function groupByCategory(records = []) {
+  return (Array.isArray(records) ? records : []).reduce((groups, record) => {
+    const category = record.category || record.evidence?.category || inferRecordCategory(record)
+    groups[category] ||= []
+    groups[category].push(record)
+    return groups
+  }, {})
 }
 
-function normalizeSource(source = {}) {
-  const url = normalize(source.url, 500);
-  const domain = normalize(source.domain, 120) || domainFromUrl(url);
-  const title = normalize(source.title, 180) || domain || url || "Untitled source";
+export function inferSchemaType(record = {}) {
+  const themes = Array.isArray(record.canonical_themes) ? record.canonical_themes : []
+  const category = (record.category || "").toLowerCase()
+  // If the record explicitly declares its category as music, prefer that.
+  if (category === "music") return "music_preferences"
+  const text = `${category} ${themes.join(" ")} ${record.evidence?.title || ""}`.toLowerCase()
+  // Anchor on word boundaries and accept common plural forms to avoid substring false-positives
+  if (/\b(?:music|songs?|playlists?|artists?|albums?|tracks?|genres?|listening)\b/.test(text)) return "music_preferences"
+  if (/reading|article|summary|scroll|finish|completion/.test(text)) return "reading_preferences"
+  if (/\b(shopping|shop|commerce|product|products)\b/.test(text)) return "shopping"
+  if (/learn|study|tutorial|course/.test(text)) return "learning"
+  if (/research|paper|source|documentation|api/.test(text)) return "research"
+  if (/focus|attention|load/.test(text)) return "attention"
+  if (/video|audio|media/.test(text)) return "media"
+  if (/code|developer|debug|github/.test(text)) return "developer_work"
+  if (/assistant|chat/.test(text)) return "ai_assistant_usage"
+  if (/\b(productivity|task|tasks|work|doc|docs)\b/.test(text)) return "productivity"
+  if (/fitness|workout|nutrition|diet|exercise/.test(text)) return "fitness"
+  if (/prefer|like|choice/.test(text)) return "preferences"
+  return "context"
+}
+
+export function createSchemaPacket(group = [], options = {}) {
+  const records = Array.isArray(group) ? group : []
+  const category = records[0]?.category || records[0]?.evidence?.category || inferRecordCategory(records[0])
+  const schemaType = options.schemaType || inferSchemaType(records[0] || {})
+  const confidence = round(records.reduce((sum, record) => sum + Number(record.meaningful_score || 0.5), 0) / Math.max(1, records.length))
+  const readingAttributes = schemaType === "reading_preferences" ? buildReadingAttributes(records) : {}
+  const musicAttributes = schemaType === "music_preferences" ? buildMusicAttributes(records) : {}
+  const productivityAttributes = schemaType === "productivity" ? buildProductivityAttributes(records) : {}
   return {
-    url,
-    domain,
-    title,
-    occurred_at: normalize(source.occurred_at, 80),
-    application: normalize(source.application, 80),
-  };
-}
-
-function domainFromUrl(value) {
-  try {
-    return new URL(value).hostname.replace(/^www\./i, "").toLowerCase();
-  } catch {
-    return "";
+    schema_version: "memact.schema_packet.v0",
+    packet_id: `schema_${slug(`${category}_${schemaType}_${records.length}`)}`,
+    category,
+    schema_type: schemaType,
+    sub_schema: inferSubSchema(records),
+    confidence,
+    attributes: {
+      record_count: records.length,
+      themes: unique(records.flatMap((record) => record.canonical_themes || [])),
+      ...readingAttributes,
+      ...musicAttributes,
+      ...productivityAttributes
+    },
+    sources: records.flatMap((record) => record.sources || []),
+    created_at: new Date().toISOString()
   }
 }
 
-function dedupeSources(sources = [], limit = MAX_SOURCES) {
-  const seen = new Set();
-  const output = [];
-  for (const raw of Array.isArray(sources) ? sources : []) {
-    const source = normalizeSource(raw);
-    const key = source.url || `${source.domain}|${source.title}`;
-    if (!key || seen.has(key)) continue;
-    seen.add(key);
-    output.push(source);
-    if (output.length >= limit) break;
+export function shapeContextProposal(input = {}, options = {}) {
+  const submission = normalizeContextInput(input)
+  const category = submission.category || options.category || "general"
+  const sourceTrail = buildContextSourceTrail(submission)
+  const confidence = submission.kind === "raw_signal" ? 0.35 : sourceTrail.length ? 0.7 : 0.55
+  const context = submission.kind === "raw_signal"
+    ? contextFromSignal(submission)
+    : sanitizeContextObject(submission.context || submission.value || {})
+
+  return {
+    schema_version: "memact.context_proposal.v0",
+    input_kind: submission.kind,
+    category,
+    title: String(submission.title || context.title || `Possible ${category} context`).trim().slice(0, 160),
+    context,
+    confidence: round(Number(submission.confidence ?? confidence)),
+    status: "pending",
+    visibility: "private",
+    user_action_required: true,
+    source_trail: sourceTrail,
+    guardrails: [
+      "Activity is not identity.",
+      "User must be able to accept, edit, reject, or delete this before it becomes memory.",
+      "Do not expose raw private data by default."
+    ],
+    created_at: new Date().toISOString()
   }
-  return output;
 }
 
-function tokenSet(value) {
-  return new Set(
-    normalize(value)
-      .toLowerCase()
-      .replace(/[^a-z0-9@#./+-]+/g, " ")
-      .split(/\s+/)
-      .filter((token) => token.length >= 3)
-  );
+export function shapeContextProposals(inputs = [], options = {}) {
+  return (Array.isArray(inputs) ? inputs : [inputs]).map((input) => shapeContextProposal(input, options))
 }
 
-function overlapScore(query, memory) {
-  const queryTokens = tokenSet(query);
-  if (!queryTokens.size) return 0;
-  const memoryTokens = tokenSet([
-    memory.label,
-    memory.summary,
-    memory.core_interpretation,
-    memory.action_tendency,
-    ...(memory.emotional_signature || []),
-    ...(memory.marker_categories || []),
-    ...(memory.matched_markers || []),
-    ...(memory.themes || []),
-    ...(memory.sources || []).map((source) => `${source.title} ${source.domain}`),
-  ].join(" "));
-  let overlap = 0;
-  for (const token of queryTokens) {
-    if (memoryTokens.has(token)) overlap += 1;
+function normalizeContextInput(input = {}) {
+  const raw = input.raw_signal || input.signal || input.activity_signal
+  if (raw && typeof raw === "object") {
+    return {
+      ...raw,
+      kind: "raw_signal",
+      category: raw.category || input.category
+    }
   }
-  return clamp(overlap / queryTokens.size);
+  return {
+    ...input,
+    kind: input.kind || input.input_kind || "context_proposal"
+  }
 }
 
-function activityMemoryFromRecord(record, options = {}) {
-  const threshold = Number(options.retentionThreshold ?? DEFAULT_RETENTION_THRESHOLD);
-  const sourcePacketId = normalize(record.packet_id || record.packet?.id || `packet:${record.id}`);
-  const sources = dedupeSources(record.sources || record.packet?.sources);
-  const themes = unique(record.canonical_themes || record.packet?.canonical_themes);
-  const meaningfulScore = clamp(record.meaningful_score ?? record.packet?.meaningful_score ?? 0);
-  const sourceScore = sources.length ? 0.08 : 0;
-  const themeScore = themes.length ? 0.08 : 0;
-  const survivalScore = clamp((meaningfulScore * 0.82) + sourceScore + themeScore);
+function contextFromSignal(signal = {}) {
+  const eventType = String(signal.event_type || signal.type || "activity").slice(0, 80)
+  const category = String(signal.category || "general").slice(0, 80)
+  return {
+    title: `Possible ${category} context`,
+    summary: `Raw ${eventType} signal needs review before it becomes memory.`,
+    signal_type: eventType,
+    evidence: sanitizeContextObject(signal.payload || signal.evidence || {}),
+    review_note: "Activity is not identity. Treat this as weak evidence until the user accepts or edits it."
+  }
+}
 
-  if (record.meaningful === false || survivalScore < threshold) {
+function buildContextSourceTrail(input = {}) {
+  if (Array.isArray(input.source_trail)) return input.source_trail.slice(0, 20).map(sanitizeContextObject)
+  if (input.kind === "raw_signal") {
+    return [{
+      type: "raw_signal",
+      event_type: String(input.event_type || input.type || "activity").slice(0, 80),
+      evidence: sanitizeContextObject(input.payload || input.evidence || {})
+    }]
+  }
+  if (input.evidence) return [{ type: "app_evidence", evidence: sanitizeContextValue(input.evidence) }]
+  return []
+}
+
+function sanitizeContextObject(value) {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return {}
+  return Object.fromEntries(Object.entries(value)
+    .filter(([key]) => !/password|secret|token|api[_-]?key|credential|otp/i.test(key))
+    .map(([key, item]) => [String(key).slice(0, 80), sanitizeContextValue(item)]))
+}
+
+function sanitizeContextValue(value) {
+  if (value === null || value === undefined) return value
+  if (Array.isArray(value)) return value.slice(0, 50).map(sanitizeContextValue)
+  if (typeof value === "object") return sanitizeContextObject(value)
+  return String(value).slice(0, 1000)
+}
+
+function inferSubSchema(records = []) {
+  const text = records.map((record) => `${record.source_label || ""} ${record.evidence?.title || ""} ${(record.canonical_themes || []).join(" ")}`).join(" ").toLowerCase()
+  if (/favorite_genre|preferred_genre|liked_genre|genre/.test(text)) return "music_genre_preference"
+  if (/artist|artist preference|frequent_artist|repeated_artist/.test(text)) return "music_artist_preference"
+  if (/playlist|mix_theme/.test(text)) return "music_playlist_theme"
+  if (/discovery|new music/.test(text)) return "music_discovery_preference"
+  if (/mood|listening mood/.test(text)) return "music_listening_mood"
+  if (/music|song|track|album|playlist|artist|genre/.test(text)) return "music_preferences"
+  if (/summary_detail_preference|summary expanded/.test(text)) return "summary_style_preference"
+  if (/quick_summary_preference|summary collapsed/.test(text)) return "summary_style_preference"
+  if (/long_read|short_read/.test(text)) return "article_length_preference"
+  if (/skipped_topic|topic skipped/.test(text)) return "skipped_topics"
+  if (/high_engagement|low_engagement|scroll/.test(text)) return "engagement_pattern"
+  if (/discount|coupon|sale|price|deal/.test(text)) return "discount"
+  if (/source|citation|reference/.test(text)) return "sources"
+  if (/task|todo|deadline/.test(text)) return "tasks"
+  if (/focus|interrupt|overload/.test(text)) return "attention_load"
+  const productivitySubSchema = inferProductivitySubSchema(text)
+  if (productivitySubSchema) return productivitySubSchema
+  return "general"
+}
+
+function buildReadingAttributes(records = []) {
+  const topics = unique(records.map((record) => record.evidence?.article_topic).filter(Boolean))
+  const skippedTopics = unique(records
+    .filter((record) => (record.canonical_themes || []).includes("skipped_topic"))
+    .map((record) => record.evidence?.article_topic)
+    .filter(Boolean))
+  const scrollDepths = records.map((record) => Number(record.evidence?.scroll_depth || 0)).filter((value) => value > 0)
+  const finishCount = records.filter((record) => (record.canonical_themes || []).includes("completion")).length
+  const longReads = records.filter((record) => (record.canonical_themes || []).includes("long_read")).length
+  const shortReads = records.filter((record) => (record.canonical_themes || []).includes("short_read")).length
+  const detailSignals = records.filter((record) => (record.canonical_themes || []).includes("summary_detail_preference")).length
+  const quickSignals = records.filter((record) => (record.canonical_themes || []).includes("quick_summary_preference")).length
+  return {
+    preferred_topics: topics.filter((topic) => !skippedTopics.includes(topic)),
+    skipped_topics: skippedTopics,
+    average_scroll_depth: scrollDepths.length ? round(scrollDepths.reduce((sum, value) => sum + value, 0) / scrollDepths.length) : 0,
+    finish_rate: records.length ? round(finishCount / records.length) : 0,
+    preferred_article_length: longReads > shortReads ? "long" : shortReads > longReads ? "short" : "unknown",
+    preferred_summary_style: detailSignals > quickSignals ? "deep_dive" : quickSignals > detailSignals ? "quick_brief" : "unknown",
+    repeat_topics: topics.filter((topic) => records.filter((record) => record.evidence?.article_topic === topic).length > 1),
+    engagement_pattern: scrollDepths.some((value) => value >= 75) ? "high_scroll_depth" : scrollDepths.some((value) => value < 35) ? "low_scroll_depth" : "unknown"
+  }
+}
+
+function buildMusicAttributes(records = []) {
+  const attributes = {}
+  for (const spec of MUSIC_FIELD_SPECS) {
+    attributes[spec.output] = collectEvidenceValues(records, spec.aliases)
+  }
+
+  // Sensitive keys are flagged for review when the app provided a meaningful value.
+  // We do NOT flag keys that are present but empty (empty string/empty array/empty object).
+  // This avoids false positives where an app includes a key name for schema reasons
+  // but does not provide identifying information (e.g. an empty `location` placeholder).
+  const sensitiveFieldsRaw = records.flatMap((record) => {
+    const evidence = record.evidence || {}
+    return Object.keys(evidence).filter((key) => {
+      if (!MUSIC_SENSITIVE_KEYS.has(key)) return false
+      const v = evidence[key]
+      if (v === undefined || v === null) return false
+      if (typeof v === "string") return v.trim() !== ""
+      if (Array.isArray(v)) return v.length > 0
+      if (typeof v === "object") return Object.keys(v).length > 0
+      // numbers and booleans are considered meaningful when present
+      return true
+    })
+  })
+  const sensitiveFields = [...new Set(sensitiveFieldsRaw)]
+
+  return {
+    ...attributes,
+    sensitive_fields: sensitiveFields,
+    review_status: sensitiveFields.length ? "needs_review" : "safe_to_propose",
+  }
+}
+
+function collectEvidenceValues(records = [], aliases = []) {
+  return unique(records.flatMap((record) => aliases.flatMap((alias) => normalizeEvidenceValue(record.evidence?.[alias])))).filter(Boolean)
+}
+
+function normalizeEvidenceValue(value) {
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => normalizeEvidenceValue(item))
+  }
+
+  if (value === null || value === undefined || value === "") {
+    return []
+  }
+
+  // Preserve string values verbatim (as single entries).
+  // Splitting on commas can break legitimate names like "Earth, Wind & Fire".
+  if (typeof value === "string") {
+    return [value.trim()]
+  }
+
+  return [String(value)]
+}
+
+export function formatSchemaReport(result) {
+  const lines = [
+    "Memact Context Report",
+    `Formation mode: ${result.formation_mode || "unknown"}`,
+    `Inferred records: ${result.source.inferred_record_count}`,
+    `Meaningful records: ${result.source.meaningful_record_count}`,
+    `Minimum support: ${result.min_support}`,
+    "",
+    "Virtual Context Patterns",
+  ];
+
+  if (!result.schemas.length) {
+    lines.push("No virtual cognitive schemas met the formation threshold.");
+    return lines.join("\n");
+  }
+
+  result.schemas.forEach((schema, index) => {
+    lines.push(`${index + 1}. ${schema.label}`);
+    lines.push(`   state=${schema.state} support=${schema.support} weighted=${schema.weighted_support.toFixed(3)} confidence=${schema.confidence.toFixed(3)}`);
+    lines.push(`   basis=${schema.formation_basis}`);
+    lines.push(`   frame=${schema.core_interpretation}`);
+  });
+
+  return lines.join("\n");
+}
+
+function induceSchemas(records, thresholds) {
+  const anchorCounts = countAnchors(records);
+  const anchors = [...anchorCounts.entries()]
+    .filter(([, count]) => count >= thresholds.minSupport)
+    .map(([anchor]) => anchor)
+    .filter((anchor) => !LOW_SIGNAL_TERMS.has(anchor));
+
+  const candidates = anchors
+    .map((anchor) => buildCandidate(anchor, records, thresholds))
+    .filter(Boolean)
+    .sort((a, b) =>
+      b.confidence - a.confidence ||
+      b.weighted_support - a.weighted_support ||
+      b.support - a.support ||
+      a.id.localeCompare(b.id)
+    );
+
+  return dedupeSchemas(candidates).slice(0, thresholds.maxSchemas);
+}
+
+function buildCandidate(anchor, records, thresholds) {
+  const scoredRecords = records
+    .map((record) => scoreRecordForAnchor(record, anchor))
+    .filter((record) => record.schema_record_score > 0)
+    .sort((a, b) => b.schema_record_score - a.schema_record_score || a.source_label.localeCompare(b.source_label));
+  const support = scoredRecords.length;
+  const weightedSupport = round(scoredRecords.reduce((sum, record) => sum + record.schema_record_score, 0), 4);
+  const activeDayCount = countActiveDays(scoredRecords);
+  const distinctSourceCount = countDistinctSources(scoredRecords);
+  const concepts = topTerms(scoredRecords.flatMap((record) => record.concepts), 10);
+  const repeatedConcepts = repeatedTerms(scoredRecords.flatMap((record) => record.concepts), 2);
+  const cognitiveDimensions = unique(scoredRecords.flatMap((record) => record.cognitive_dimensions));
+  const matchedThemes = topTerms(scoredRecords.flatMap((record) => record.themes), 8);
+  const cohesion = round(averageCohesion(scoredRecords));
+
+  if (
+    support < thresholds.minSupport ||
+    weightedSupport < thresholds.minWeightedSupport ||
+    cohesion < thresholds.minCohesion ||
+    !hasSchemaSubstance({ anchor, repeatedConcepts, cognitiveDimensions, distinctSourceCount })
+  ) {
     return null;
   }
 
-  return {
-    id: `memory:activity:${slug(sourcePacketId)}`,
-    type: "activity_memory",
-    label: normalize(record.source_label || record.packet?.label || record.evidence?.title || "Activity memory", 180),
-    summary: normalize(record.evidence?.text_excerpt || record.packet?.evidence?.text_excerpt, 360),
-    strength: survivalScore,
-    survival_score: survivalScore,
-    meaningful_score: meaningfulScore,
-    source_packet_id: sourcePacketId,
-    source_record_id: normalize(record.id || record.packet?.source_record_id),
-    themes,
-    sources,
-    reasons: unique(record.meaning_reasons || record.packet?.reasons),
-    first_seen_at: normalize(record.started_at || record.packet?.started_at || sources[0]?.occurred_at),
-    last_seen_at: normalize(record.ended_at || record.packet?.ended_at || record.started_at || sources[0]?.occurred_at),
-    provenance: {
-      system: "inference",
-      claim_type: "meaning_packet",
-      packet_id: sourcePacketId,
-    },
-    state: "active",
-  };
-}
-
-function schemaMemoryFromSchema(schema) {
-  const id = normalize(schema?.id);
-  if (!id) return null;
-  const packet = schema.virtual_schema_packet || schema.schema_packet || {};
-  const evidenceRecords = Array.isArray(schema.evidence_records) ? schema.evidence_records : [];
-  const evidenceStrength = evidenceRecords.length
-    ? evidenceRecords.reduce((sum, record) => sum + Number(record.meaningful_score ?? 1), 0) / evidenceRecords.length
-    : 0.5;
-  const confidence = Number(schema.confidence ?? 0);
-  const support = Number(schema.support ?? 0);
-  const markerCategoryCount = Array.isArray(schema.marker_categories) ? schema.marker_categories.length : 0;
-  const markerCoverage = Math.min(1, markerCategoryCount / 3);
-  const strength = clamp((confidence * 0.48) + (Math.min(1, support / 8) * 0.22) + (evidenceStrength * 0.18) + (markerCoverage * 0.12));
-  const evidencePacketIds = unique([
-    ...(packet.evidence_packet_ids || []),
-    ...evidenceRecords.map((record) => normalize(record.packet_id || `packet:${record.id}`)),
-  ]);
-  const sources = dedupeSources([
-    ...(packet.sources || []),
-    ...evidenceRecords.flatMap((record) => record.sources || []),
-  ]);
+  const evidenceRecords = scoredRecords.slice(0, 10).map((record) => ({
+    id: record.id,
+    packet_id: record.packet_id,
+    source_label: record.source_label,
+    concepts: record.concepts,
+    themes: record.themes,
+    cognitive_dimensions: record.cognitive_dimensions,
+    schema_record_score: record.schema_record_score,
+    meaningful_score: record.meaningful_score,
+    meaning_reasons: record.meaning_reasons,
+    sources: record.sources,
+  }));
+  const repetition = Math.min(1, support / Math.max(thresholds.minSupport, 8));
+  const sourceSpread = Math.min(1, distinctSourceCount / Math.max(2, Math.min(support, 4)));
+  const timeSpread = Math.min(1, activeDayCount / Math.max(2, Math.min(support, 4)));
+  const dimensionSpread = Math.min(1, cognitiveDimensions.length / 3);
+  const conceptSpread = Math.min(1, repeatedConcepts.length / 5);
+  const confidence = round(
+    (repetition * 0.24) +
+      (sourceSpread * 0.18) +
+      (timeSpread * 0.12) +
+      (cohesion * 0.18) +
+      (dimensionSpread * 0.16) +
+      (conceptSpread * 0.12)
+  );
+  const state = resolveSchemaLifecycleState({ support, confidence, activeDayCount, distinctSourceCount }, thresholds);
+  const label = buildDynamicLabel(anchor, concepts, cognitiveDimensions);
+  const coreInterpretation = buildCoreInterpretation(concepts, cognitiveDimensions);
+  const actionTendency = buildActionTendency(concepts, cognitiveDimensions);
+  const emotionalSignature = buildEmotionalSignature(cognitiveDimensions, concepts);
+  const schemaGraph = buildVirtualSchemaGraph({
+    id: `induced_${slug([anchor, ...concepts.slice(0, 3)].join("_"))}`,
+    label,
+    concepts,
+    cognitiveDimensions,
+    evidenceRecords,
+    state,
+    confidence,
+  });
 
   return {
-    id: `memory:schema:${slug(id)}`,
-    type: "cognitive_schema_memory",
-    label: normalize(packet.label || schema.label || id, 160),
-    summary: normalize(schema.summary || packet.summary, 360),
+    id: `induced_${slug([anchor, ...concepts.slice(0, 3)].join("_"))}`,
+    label,
+    summary: `An induced virtual schema connecting ${concepts.slice(0, 5).join(", ")} across repeated meaningful activity.`,
+    schema_kind: "virtual_cognitive_schema",
+    formation_mode: "evidence_induced",
     virtual: true,
     cognitive_schema: true,
-    strength,
-    survival_score: strength,
-    schema_id: id,
-    schema_packet_id: normalize(packet.id || `schema_packet:${id}`),
-    schema_state: normalize(schema.state),
-    state_label: normalize(schema.state_label),
-    core_interpretation: normalize(packet.core_interpretation || schema.core_interpretation, 280),
-    action_tendency: normalize(packet.action_tendency || schema.action_tendency, 240),
-    emotional_signature: unique(packet.emotional_signature || schema.emotional_signature),
-    marker_categories: unique(packet.marker_categories || schema.marker_categories),
-    matched_markers: unique(packet.matched_markers || schema.matched_markers),
-    formation_basis: normalize(schema.formation_basis, 500),
-    formation_metrics: schema.formation_metrics || packet.formation_metrics || {},
-    support,
-    confidence,
-    themes: unique(packet.matched_themes || schema.matched_themes),
-    evidence_packet_ids: evidencePacketIds,
-    sources,
-    provenance: {
-      system: "schema",
-      claim_type: "virtual_cognitive_schema_packet",
-      schema_packet_id: normalize(packet.id || `schema_packet:${id}`),
-      schema_id: id,
-      guardrail: normalize(schema.language_guardrail),
-    },
-    state: "active",
-  };
-}
-
-function intentMemoriesFromResult(intentResult = {}) {
-  if (!intentResult) return [];
-  const intents = Array.isArray(intentResult.predicted_intents)
-    ? intentResult.predicted_intents
-    : Array.isArray(intentResult.intents)
-      ? intentResult.intents
-      : intentResult.id
-        ? [intentResult]
-        : [];
-  const safety = intentResult.safety || {};
-  const generatedAt = normalize(intentResult.generated_at || nowIso(), 80);
-
-  return intents.map((intent) => intentMemoryFromIntent(intent, { safety, generatedAt })).filter(Boolean);
-}
-
-function intentMemoryFromIntent(intent = {}, context = {}) {
-  const id = normalize(intent.id || intent.intent_id || intent.label);
-  if (!id) return null;
-  const evidence = Array.isArray(intent.evidence) ? intent.evidence : [];
-  const evidenceIds = unique(evidence.map((item) => item.source_id || item.id || item.packet_id));
-  const sources = dedupeSources(evidence.map((item) => ({
-    url: item.url,
-    domain: item.domain,
-    title: item.label || item.title,
-    occurred_at: item.timestamp,
-    application: item.application,
-  })));
-  const confidence = clamp(intent.confidence ?? 0);
-  const label = normalize(intent.label || id, 180);
-
-  return {
-    id: `memory:intent:${slug(id)}`,
-    type: "intent_memory",
-    label,
-    summary: normalize(intent.summary || `Intent hypothesis: ${label}`, 360),
-    strength: confidence,
-    survival_score: confidence,
-    intent_id: id,
-    intent_category: normalize(intent.category, 120),
-    confidence,
-    confidence_level: normalize(intent.confidence_level, 80),
-    confidence_basis: intent.confidence_basis || {},
-    evidence_ids: evidenceIds,
-    evidence,
-    alternative_intents: Array.isArray(intent.alternative_intents) ? intent.alternative_intents : [],
-    allowed_actions: unique(intent.allowed_actions),
-    blocked_actions: unique(intent.blocked_actions),
-    notes: unique(intent.notes),
-    safety: context.safety || {},
-    themes: unique([intent.category, ...(intent.themes || [])]),
-    sources,
-    reasons: unique([
-      intent.confidence_level ? `${intent.confidence_level} confidence intent hypothesis` : "intent hypothesis",
-      evidenceIds.length ? `${evidenceIds.length} evidence item${evidenceIds.length === 1 ? "" : "s"}` : "",
-    ]),
-    first_seen_at: context.generatedAt || nowIso(),
-    last_seen_at: context.generatedAt || nowIso(),
-    provenance: {
-      system: "intent",
-      claim_type: "intent_hypothesis",
-      schema_version: "memact.intent.v0",
-      intent_id: id,
-    },
-    state: "active",
-  };
-}
-
-function decayMemory(memory, options = {}) {
-  const decayPerDay = Number(options.decayPerDay ?? DEFAULT_DECAY_PER_DAY);
-  const ageDays = daysSince(memory.last_seen_at || memory.first_seen_at);
-  const decay = Math.min(0.35, ageDays * decayPerDay);
-  const decayedStrength = clamp(Number(memory.strength || 0) - decay);
-  
-  // Calculate automated TTL expiration trigger thresholds
-  let expirationReason = "";
-  let state = memory.state || "active";
-
-  if (ageDays >= 30) {
-    state = "forgotten";
-    expirationReason = `Inactive for ${Math.floor(ageDays)} days`;
-  } else if (decayedStrength <= Number(options.retentionThreshold ?? DEFAULT_RETENTION_THRESHOLD)) {
-    state = "forgotten";
-    expirationReason = `Memory retention strength fallen below threshold (${decayedStrength})`;
-  }
-
-  return {
-    ...memory,
+    core_interpretation: coreInterpretation,
+    action_tendency: actionTendency,
+    emotional_signature: emotionalSignature,
     state,
-    strength: decayedStrength,
-    decay: {
-      age_days: Number(ageDays.toFixed(2)),
-      decay_amount: Number(decay.toFixed(4)),
-      decay_per_day: decayPerDay,
-      expiration_reason: expirationReason || null
+    lifecycle_state: state,
+    state_label: schemaLifecycleLabel(state),
+    anchor_concept: anchor,
+    matched_themes: matchedThemes,
+    matched_markers: concepts,
+    marker_categories: cognitiveDimensions,
+    support,
+    weighted_support: weightedSupport,
+    distinct_source_count: distinctSourceCount,
+    active_day_count: activeDayCount,
+    cohesion,
+    confidence,
+    nodes: schemaGraph.nodes,
+    edges: schemaGraph.edges,
+    schema_graph: schemaGraph,
+    formation_basis: buildFormationBasis({
+      support,
+      weightedSupport,
+      distinctSourceCount,
+      activeDayCount,
+      concepts,
+      cognitiveDimensions,
+      cohesion,
+    }),
+    formation_metrics: {
+      support,
+      weighted_support: weightedSupport,
+      distinct_source_count: distinctSourceCount,
+      active_day_count: activeDayCount,
+      cohesion,
+      repeated_concept_count: repeatedConcepts.length,
+      cognitive_dimension_count: cognitiveDimensions.length,
+      confidence,
     },
+    virtual_schema_packet: {
+      id: `schema_packet:induced_${slug([anchor, ...concepts.slice(0, 3)].join("_"))}`,
+      type: "virtual_cognitive_schema_packet",
+      label,
+      formation_mode: "evidence_induced",
+      lifecycle_state: state,
+      core_interpretation: coreInterpretation,
+      action_tendency: actionTendency,
+      emotional_signature: emotionalSignature,
+      matched_themes: matchedThemes,
+      matched_markers: concepts,
+      marker_categories: cognitiveDimensions,
+      support,
+      weighted_support: weightedSupport,
+      cohesion,
+      confidence,
+      formation_metrics: {
+        support,
+        weighted_support: weightedSupport,
+        distinct_source_count: distinctSourceCount,
+        active_day_count: activeDayCount,
+        cohesion,
+        cognitive_dimensions: cognitiveDimensions,
+      },
+      evidence_packet_ids: evidenceRecords.map((record) => record.packet_id || `packet:${record.id}`),
+      nodes: schemaGraph.nodes,
+      edges: schemaGraph.edges,
+    },
+    evidence_records: evidenceRecords,
+    claim_type: "virtual_cognitive_schema_signal",
+    language_guardrail: "This is an induced virtual cognitive-schema signal from repeated evidence, not a diagnosis or causal certainty.",
   };
 }
 
-function mergeDuplicateMemories(memories) {
-  const byKey = new Map();
-  for (const memory of memories) {
-    const key = isSchemaMemory(memory)
-      ? `${memory.type}|${memory.schema_id}`
-      : isIntentMemory(memory)
-        ? `${memory.type}|${memory.intent_id || memory.label}`
-        : `${memory.type}|${memory.source_packet_id || memory.label}`;
-    const existing = byKey.get(key);
-    if (!existing) {
-      byKey.set(key, memory);
-      continue;
-    }
-    byKey.set(key, {
-      ...existing,
-      strength: clamp(Math.max(existing.strength, memory.strength) + 0.04),
-      survival_score: clamp(Math.max(existing.survival_score, memory.survival_score) + 0.04),
-      themes: unique([...(existing.themes || []), ...(memory.themes || [])]),
-      sources: dedupeSources([...(existing.sources || []), ...(memory.sources || [])]),
-      reasons: unique([...(existing.reasons || []), ...(memory.reasons || [])]),
-      last_seen_at: [existing.last_seen_at, memory.last_seen_at].sort().filter(Boolean).at(-1) || existing.last_seen_at,
-    });
-  }
-  return [...byKey.values()];
+function profileRecord(record) {
+  const text = collectRecordText(record);
+  const tokens = tokenize(text);
+  const themes = unique(record.canonical_themes ?? []);
+  const concepts = unique([
+    ...themes.map((theme) => normalize(theme).toLowerCase()),
+    ...tokens.filter((token) => !LOW_SIGNAL_TERMS.has(token)),
+    ...extractBigrams(tokens),
+  ]).slice(0, 40);
+  const cognitiveDimensions = detectCognitiveDimensions(text, concepts);
+  return {
+    id: record.id,
+    packet_id: record.packet_id ?? null,
+    source_label: normalize(record.source_label || record.evidence?.title || "meaning packet"),
+    started_at: record.started_at,
+    ended_at: record.ended_at,
+    concepts,
+    themes,
+    cognitive_dimensions: cognitiveDimensions,
+    meaningful_score: Number(record.meaningful_score ?? 0.58),
+    meaning_reasons: record.meaning_reasons ?? [],
+    sources: record.sources ?? [],
+  };
 }
 
-function buildMemoryGraph(memories, relations = []) {
+function inferRecordCategory(record = {}) {
+  const text = `${record.category || ""} ${record.source_label || ""} ${record.evidence?.title || ""} ${(record.canonical_themes || []).join(" ")}`.toLowerCase()
+  if (/reading|article|summary|scroll|finish/.test(text)) return "reading"
+  if (/\b(shopping|shop|commerce|product|products|discount|price)\b/.test(text)) return "shopping"
+  if (/learn|study|tutorial|course/.test(text)) return "learning"
+  if (/research|paper|source|documentation|api/.test(text)) return "research"
+  if (/focus|attention|load/.test(text)) return "attention"
+  if (/video|audio|media/.test(text)) return "media"
+  if (/code|developer|debug|github/.test(text)) return "developer_work"
+  if (/assistant|chat/.test(text)) return "ai_assistant_usage"
+  if (/\b(productivity|task|tasks|work|doc|docs)\b/.test(text)) return "productivity"
+  if (/fitness|workout|nutrition|diet|exercise/.test(text)) return "fitness"
+  if (/health|medical|allergy|diagnosis/.test(text)) return "health" // ◄ ADD THIS LINE
+  if (/prefer|like|choice/.test(text)) return "preferences"
+  return "general"
+}
+
+function scoreRecordForAnchor(record, anchor) {
+  const conceptSet = new Set(record.concepts);
+  if (!conceptSet.has(anchor)) {
+    return { ...record, schema_record_score: 0 };
+  }
+  const conceptDensity = Math.min(1, record.concepts.length / 12);
+  const dimensionScore = Math.min(1, record.cognitive_dimensions.length / 3);
+  const sourceScore = Array.isArray(record.sources) && record.sources.length ? 0.08 : 0;
+  const meaningfulScore = Number(record.meaningful_score ?? 0.58);
+  const score = round(
+    Math.min(1, 0.42 + (conceptDensity * 0.18) + (dimensionScore * 0.2) + (meaningfulScore * 0.12) + sourceScore)
+  );
+  return {
+    ...record,
+    schema_record_score: score,
+  };
+}
+
+function hasSchemaSubstance({ anchor, repeatedConcepts, cognitiveDimensions, distinctSourceCount }) {
+  const repeatedBeyondAnchor = repeatedConcepts.filter((term) => term !== anchor && !LOW_SIGNAL_TERMS.has(term));
+  return cognitiveDimensions.length > 0 || (repeatedBeyondAnchor.length >= 2 && distinctSourceCount >= 2);
+}
+
+function buildDynamicLabel(anchor, concepts, cognitiveDimensions) {
+  const labelConcepts = unique([anchor, ...concepts.filter((concept) => concept !== anchor)]).slice(0, 2);
+  const dimension = cognitiveDimensions[0] ? `${titleCase(cognitiveDimensions[0])} frame` : "Repeated frame";
+  return `${labelConcepts.map(titleCase).join(" / ")} ${dimension}`;
+}
+
+function buildCoreInterpretation(concepts, dimensions) {
+  const conceptText = concepts.slice(0, 4).map(titleCase).join(", ");
+  if (dimensions.length) {
+    return `Memact sees ${conceptText} repeatedly appearing through ${dimensions.join(", ")} signals.`;
+  }
+  return `Memact sees ${conceptText} repeatedly appearing together across meaningful activity.`;
+}
+
+function buildActionTendency(concepts, dimensions) {
+  if (dimensions.includes("action")) {
+    return `move toward activity around ${concepts.slice(0, 3).join(", ")}`;
+  }
+  if (dimensions.includes("evaluation")) {
+    return `judge or compare activity around ${concepts.slice(0, 3).join(", ")}`;
+  }
+  if (dimensions.includes("identity")) {
+    return `connect ${concepts.slice(0, 3).join(", ")} to self-direction`;
+  }
+  return `revisit and connect ${concepts.slice(0, 3).join(", ")}`;
+}
+
+function buildEmotionalSignature(dimensions, concepts) {
+  const output = [];
+  if (dimensions.includes("affect")) output.push("emotion-linked");
+  if (dimensions.includes("evaluation")) output.push("evaluation pressure");
+  if (dimensions.includes("identity")) output.push("identity relevance");
+  if (dimensions.includes("social")) output.push("social visibility");
+  if (!output.length && concepts.length) output.push("repeated salience");
+  return output;
+}
+
+function countAnchors(records) {
+  const counts = new Map();
+  records.forEach((record) => {
+    unique(record.concepts).forEach((concept) => {
+      counts.set(concept, (counts.get(concept) || 0) + 1);
+    });
+  });
+  return counts;
+}
+
+function averageCohesion(records) {
+  if (records.length <= 1) return 1;
+  let total = 0;
+  let pairs = 0;
+  for (let i = 0; i < records.length; i += 1) {
+    for (let j = i + 1; j < records.length; j += 1) {
+      total += jaccard(records[i].concepts, records[j].concepts);
+      pairs += 1;
+    }
+  }
+  return pairs ? total / pairs : 0;
+}
+
+function jaccard(left, right) {
+  const leftSet = new Set(left);
+  const rightSet = new Set(right);
+  const union = new Set([...leftSet, ...rightSet]);
+  if (!union.size) return 0;
+  let intersection = 0;
+  leftSet.forEach((value) => {
+    if (rightSet.has(value)) intersection += 1;
+  });
+  return intersection / union.size;
+}
+
+function dedupeSchemas(candidates) {
+  const accepted = [];
+  for (const candidate of candidates) {
+    const duplicate = accepted.some((schema) => jaccard(schema.matched_markers, candidate.matched_markers) >= 0.72);
+    if (!duplicate) accepted.push(candidate);
+  }
+  return accepted;
+}
+
+function buildSchemaNetwork(schemas) {
   const nodes = [];
   const edges = [];
   const seen = new Set();
@@ -410,972 +834,307 @@ function buildMemoryGraph(memories, relations = []) {
     nodes.push(node);
   };
 
-  for (const memory of memories) {
+  schemas.forEach((schema) => {
+    const schemaId = `schema:${schema.id}`;
     addNode({
-      id: memory.id,
-      type: memory.type,
-      label: memory.label,
-      strength: memory.strength,
-      state: memory.state,
+      id: schemaId,
+      type: "virtual_cognitive_schema",
+      label: schema.label,
+      formation_mode: schema.formation_mode,
+      state: schema.state,
+      lifecycle_state: schema.lifecycle_state || schema.state,
+      confidence: schema.confidence,
     });
 
-    for (const theme of memory.themes || []) {
-      const themeId = `memory:theme:${slug(theme)}`;
-      addNode({ id: themeId, type: "theme_memory", label: theme });
-      edges.push({ from: memory.id, to: themeId, type: "has_theme", weight: memory.strength });
-    }
-
-    for (const source of memory.sources || []) {
-      const sourceKey = source.url || source.domain || source.title;
-      if (!sourceKey) continue;
-      const sourceId = `memory:source:${slug(sourceKey)}`;
-      addNode({
-        id: sourceId,
-        type: "source_memory",
-        label: source.title || source.domain || source.url,
-        url: source.url,
-        domain: source.domain,
-      });
-      edges.push({ from: memory.id, to: sourceId, type: "supported_by_source", weight: 1 });
-    }
-
-    if (isSchemaMemory(memory)) {
-      const schemaPacketId = memory.schema_packet_id || `schema_packet:${slug(memory.schema_id)}`;
-      addNode({
-        id: schemaPacketId,
-        type: "virtual_cognitive_schema_packet",
-        label: memory.label,
-        strength: memory.strength,
-      });
-      edges.push({ from: memory.id, to: schemaPacketId, type: "stores_schema_packet", weight: memory.strength });
-
-      for (const marker of memory.matched_markers || []) {
-        const markerId = `memory:schema_marker:${slug(marker)}`;
-        addNode({ id: markerId, type: "schema_marker_memory", label: marker });
-        edges.push({ from: memory.id, to: markerId, type: "has_cognitive_marker", weight: memory.strength });
-      }
-
-      for (const packetId of memory.evidence_packet_ids || []) {
-        const activityId = `memory:activity:${slug(packetId)}`;
-        edges.push({ from: memory.id, to: activityId, type: "supported_by_packet", weight: memory.strength });
-      }
-    }
-
-    if (isIntentMemory(memory)) {
-      const intentNodeId = memory.intent_id || `intent:${slug(memory.label)}`;
-      addNode({
-        id: intentNodeId,
-        type: "intent_hypothesis",
-        label: memory.label,
-        confidence: memory.confidence,
-      });
-      edges.push({ from: memory.id, to: intentNodeId, type: "stores_intent_hypothesis", weight: memory.strength });
-
-      for (const evidenceId of memory.evidence_ids || []) {
-        edges.push({
-          from: memory.id,
-          to: evidenceId,
-          type: MEMORY_RELATION_TYPES.EVIDENCED_BY,
-          weight: memory.strength,
-        });
-      }
-    }
-  }
-
-  for (const rawRelation of Array.isArray(relations) ? relations : []) {
-    const relation = normalizeRelationInput(rawRelation);
-    if (!relation.from || !relation.to) continue;
-    edges.push({
-      id: relation.id,
-      from: relation.from,
-      to: relation.to,
-      type: relation.type,
-      category: relation.category,
-      weight: relation.weight,
-      confidence: relation.confidence,
-      directed: relation.directed,
-      valid_from: relation.valid_from,
-      valid_until: relation.valid_until,
-      recorded_at: relation.recorded_at,
-      invalidated_by: relation.invalidated_by,
-      evidence: relation.evidence,
+    (schema.matched_markers ?? []).forEach((concept) => {
+      const conceptId = `concept:${slug(concept)}`;
+      addNode({ id: conceptId, type: "concept", label: concept });
+      edges.push({ from: schemaId, to: conceptId, type: "contains_concept", weight: 1 });
     });
-  }
+
+    (schema.marker_categories ?? []).forEach((dimension) => {
+      const dimensionId = `dimension:${slug(dimension)}`;
+      addNode({ id: dimensionId, type: "cognitive_dimension", label: dimension });
+      edges.push({ from: schemaId, to: dimensionId, type: "has_cognitive_dimension", weight: 1 });
+    });
+
+    (schema.evidence_records ?? []).forEach((record) => {
+      const packetId = record.packet_id || `packet:${record.id}`;
+      addNode({
+        id: packetId,
+        type: "meaning_packet",
+        label: record.source_label,
+        score: Number(record.meaningful_score ?? 1),
+      });
+      edges.push({
+        from: schemaId,
+        to: packetId,
+        type: "supported_by_packet",
+        weight: Number(record.schema_record_score ?? record.meaningful_score ?? 1),
+      });
+    });
+  });
 
   return { nodes, edges };
 }
 
-function makeAction(type, memoryId, payload = {}, accepted = true, reason = "") {
-  return {
-    id: `action:${Date.now()}:${Math.random().toString(36).slice(2, 8)}`,
-    type,
-    memory_id: memoryId,
-    accepted,
-    reason: normalize(reason),
-    payload,
-    occurred_at: nowIso(),
+function buildVirtualSchemaGraph({ id, label, concepts, cognitiveDimensions, evidenceRecords, state, confidence }) {
+  const schemaId = `schema:${id}`;
+  const nodes = [
+    {
+      id: schemaId,
+      type: "virtual_cognitive_schema",
+      category: "schema",
+      label,
+      lifecycle_state: state,
+      confidence,
+    },
+  ];
+  const edges = [];
+  const seen = new Set([schemaId]);
+  const addNode = (node) => {
+    if (!node?.id || seen.has(node.id)) return;
+    seen.add(node.id);
+    nodes.push(node);
   };
-}
 
-function emptyMemoryStore(previous = {}) {
-  const memories = Array.isArray(previous.memories) ? previous.memories : [];
-  const relations = Array.isArray(previous.relations) ? previous.relations : [];
-  return refreshMemoryStore({
-    schema_version: previous.schema_version || MEMORY_SCHEMA_VERSION,
-    generated_at: previous.generated_at || nowIso(),
-    source: previous.source || {},
-    thresholds: previous.thresholds || {},
-    memories,
-    relations,
-    actions: Array.isArray(previous.actions) ? previous.actions : [],
+  concepts.slice(0, 12).forEach((concept) => {
+    const conceptId = `concept:${slug(concept)}`;
+    addNode({ id: conceptId, type: "concept", category: "schema_marker", label: concept });
+    edges.push({ from: schemaId, to: conceptId, type: "contains_marker", category: "schema_structure", weight: 1 });
   });
-}
 
-export function reindexMemoryStore(memoryStore = {}) {
-  const memories = Array.isArray(memoryStore.memories) ? memoryStore.memories : [];
-  const relations = (Array.isArray(memoryStore.relations) ? memoryStore.relations : []).map(normalizeRelationInput);
-  const graph = buildMemoryGraph(memories, relations);
-  return {
-    schema_version: memoryStore.schema_version || MEMORY_SCHEMA_VERSION,
-    generated_at: memoryStore.generated_at || nowIso(),
-    source: memoryStore.source || {},
-    thresholds: memoryStore.thresholds || {},
-    memories,
-    relations,
-    activity_memories: memories.filter((memory) => memory.type === "activity_memory"),
-    intent_memories: memories.filter(isIntentMemory),
-    schema_packets: memories.filter(isSchemaMemory),
-    cognitive_schema_memories: memories.filter(isSchemaMemory),
-    graph,
-    actions: Array.isArray(memoryStore.actions) ? memoryStore.actions : [],
-    graph_snapshots: Array.isArray(memoryStore.graph_snapshots) ? memoryStore.graph_snapshots : [],
-    stats: {
-      memoryCount: memories.length,
-      activityMemoryCount: memories.filter((memory) => memory.type === "activity_memory").length,
-      intentMemoryCount: memories.filter(isIntentMemory).length,
-      schemaMemoryCount: memories.filter(isSchemaMemory).length,
-      sourceCount: graph.nodes.filter((node) => node.type === "source_memory").length,
-    },
-  };
-}
-
-function refreshMemoryStore(memoryStore = {}) {
-  return reindexMemoryStore({ ...memoryStore, generated_at: nowIso() });
-}
-
-function normalizeMemoryInput(input = {}) {
-  const id = normalize(input.id) || `memory:manual:${slug(input.label || input.summary || Date.now())}`;
-  const type = normalize(input.type) || "activity_memory";
-  const strength = clamp(input.strength ?? input.survival_score ?? DEFAULT_RETENTION_THRESHOLD);
-  const fieldPath = normalize(input.field_path || input.path || input.attributes?.field_path, 180);
-  const category = normalize(input.category || input.attributes?.category || input.provenance?.category, 120);
-  const status = normalize(input.status || input.state || "active", 80);
-  const sensitivity = normalize(input.sensitivity || input.attributes?.sensitivity || "normal", 80).toLowerCase();
-  return {
-    id,
-    type,
-    label: normalize(input.label || id, 180),
-    summary: normalize(input.summary, 500),
-    field_path: fieldPath,
-    category,
-    status,
-    sensitivity,
-    source_app_id: normalize(input.source_app_id || input.provenance?.app_id || input.provenance?.source_app_id, 160),
-    allowed_app_ids: Array.isArray(input.allowed_app_ids) ? unique(input.allowed_app_ids) : [],
-    allowed_actor_types: Array.isArray(input.allowed_actor_types) ? unique(input.allowed_actor_types) : ["memact_worker"],
-    virtual: Boolean(input.virtual),
-    cognitive_schema: Boolean(input.cognitive_schema || type === "cognitive_schema_memory"),
-    strength,
-    survival_score: clamp(input.survival_score ?? strength),
-    themes: unique(input.themes),
-    sources: dedupeSources(input.sources),
-    reasons: unique(input.reasons),
-    first_seen_at: normalize(input.first_seen_at || input.created_at || nowIso()),
-    last_seen_at: normalize(input.last_seen_at || input.updated_at || nowIso()),
-    state: normalize(input.state) || "active",
-    provenance: {
-      system: normalize(input.provenance?.system || "memory"),
-      claim_type: normalize(input.provenance?.claim_type || "manual_memory"),
-      ...input.provenance,
-    },
-    ...input,
-    id,
-    type,
-    field_path: fieldPath,
-    category,
-    status,
-    sensitivity,
-  };
-}
-
-export function buildMemoryStore({ inference, schema, intent, previousMemory = null, options = {} } = {}) {
-  const activityMemories = (Array.isArray(inference?.records) ? inference.records : [])
-    .map((record) => activityMemoryFromRecord(record, options))
-    .filter(Boolean);
-  const schemaPackets = (Array.isArray(schema?.schemas) ? schema.schemas : [])
-    .map(schemaMemoryFromSchema)
-    .filter(Boolean);
-  const intentMemories = intentMemoriesFromResult(intent);
-  const previousMemories = Array.isArray(previousMemory?.memories) ? previousMemory.memories : [];
-  const previousRelations = Array.isArray(previousMemory?.relations) ? previousMemory.relations : [];
-  const merged = mergeDuplicateMemories([...previousMemories, ...activityMemories, ...schemaPackets, ...intentMemories])
-    .map((memory) => decayMemory(memory, options))
-    .sort((left, right) => right.strength - left.strength || left.label.localeCompare(right.label));
-  const relations = previousRelations.map(normalizeRelationInput);
-  const graph = buildMemoryGraph(merged, relations);
-
-  return {
-    schema_version: MEMORY_SCHEMA_VERSION,
-    generated_at: nowIso(),
-    source: {
-      inference_schema_version: inference?.schema_version || null,
-      schema_schema_version: schema?.schema_version || null,
-      intent_schema_version: intent?.schema_version || null,
-      previous_memory_version: previousMemory?.schema_version || null,
-    },
-    thresholds: {
-      retention_score: Number(options.retentionThreshold ?? DEFAULT_RETENTION_THRESHOLD),
-      decay_per_day: Number(options.decayPerDay ?? DEFAULT_DECAY_PER_DAY),
-    },
-    memories: merged,
-    relations,
-    activity_memories: merged.filter((memory) => memory.type === "activity_memory"),
-    intent_memories: merged.filter(isIntentMemory),
-    schema_packets: merged.filter(isSchemaMemory),
-    cognitive_schema_memories: merged.filter(isSchemaMemory),
-    graph,
-    actions: Array.isArray(previousMemory?.actions) ? previousMemory.actions : [],
-    stats: {
-      memoryCount: merged.length,
-      activityMemoryCount: merged.filter((memory) => memory.type === "activity_memory").length,
-      intentMemoryCount: merged.filter(isIntentMemory).length,
-      schemaMemoryCount: merged.filter(isSchemaMemory).length,
-      sourceCount: graph.nodes.filter((node) => node.type === "source_memory").length,
-    },
-  };
-}
-
-export function createMemory(memoryInput, memoryStore = {}) {
-  const memory = normalizeMemoryInput(memoryInput);
-  const existing = (memoryStore.memories || []).some((item) => item.id === memory.id);
-  if (existing) {
-    return {
-      memoryStore: emptyMemoryStore(memoryStore),
-      memory: readMemory(memory.id, memoryStore),
-      action: makeAction("create_memory", memory.id, {}, false, "memory already exists"),
-    };
-  }
-  const action = makeAction("create_memory", memory.id, { type: memory.type }, true, "memory created");
-  const next = refreshMemoryStore({
-    ...memoryStore,
-    memories: [...(memoryStore.memories || []), memory],
-    actions: [...(memoryStore.actions || []), action],
+  cognitiveDimensions.forEach((dimension) => {
+    const dimensionId = `dimension:${slug(dimension)}`;
+    addNode({ id: dimensionId, type: "cognitive_dimension", category: "schema_category", label: dimension });
+    edges.push({ from: schemaId, to: dimensionId, type: "classified_as", category: "schema_classification", weight: 1 });
   });
-  return { memoryStore: next, memory, action };
-}
 
-export function readMemory(memoryId, memoryStore = {}) {
-  const id = normalize(memoryId);
-  return (memoryStore.memories || []).find((memory) => memory.id === id) || null;
-}
-
-export function listMemories(memoryStore = {}, filters = {}) {
-  const type = normalize(filters.type);
-  const state = normalize(filters.state);
-  const includeForgotten = Boolean(filters.includeForgotten);
-  return (memoryStore.memories || [])
-    .filter((memory) => !type || memory.type === type)
-    .filter((memory) => !state || memory.state === state)
-    .filter((memory) => includeForgotten || memory.state !== "forgotten")
-    .sort((left, right) => Number(right.strength || 0) - Number(left.strength || 0) || left.label.localeCompare(right.label));
-}
-
-export function updateMemory(memoryId, patch = {}, memoryStore = {}) {
-  const id = normalize(memoryId);
-  let updated = null;
-  const memories = (memoryStore.memories || []).map((memory) => {
-    if (memory.id !== id) return memory;
-    updated = normalizeMemoryInput({
-      ...memory,
-      ...patch,
-      id: memory.id,
-      type: patch.type || memory.type,
-      sources: patch.sources ? dedupeSources([...(memory.sources || []), ...patch.sources]) : memory.sources,
-      themes: patch.themes ? unique([...(memory.themes || []), ...patch.themes]) : memory.themes,
-      reasons: patch.reasons ? unique([...(memory.reasons || []), ...patch.reasons]) : memory.reasons,
-      last_seen_at: patch.last_seen_at || nowIso(),
+  evidenceRecords.slice(0, 8).forEach((record) => {
+    const packetId = record.packet_id || `packet:${record.id}`;
+    addNode({
+      id: packetId,
+      type: "meaning_packet",
+      category: "evidence",
+      label: record.source_label,
+      score: Number(record.meaningful_score ?? 1),
     });
-    return updated;
+    edges.push({
+      from: packetId,
+      to: schemaId,
+      type: "supports_schema",
+      category: "evidence_support",
+      weight: Number(record.schema_record_score ?? record.meaningful_score ?? 1),
+    });
   });
-  const action = makeAction("update_memory", id, { patch_keys: Object.keys(patch || {}) }, Boolean(updated), updated ? "memory updated" : "memory not found");
-  const next = refreshMemoryStore({
-    ...memoryStore,
-    memories,
-    actions: [...(memoryStore.actions || []), action],
-  });
-  return { memoryStore: next, memory: updated, action };
+
+  return { nodes, edges };
 }
 
-export function deleteMemory(memoryId, memoryStore = {}, options = {}) {
-  if (options.hard) {
-    const id = normalize(memoryId);
-    const before = (memoryStore.memories || []).length;
-    const memories = (memoryStore.memories || []).filter((memory) => memory.id !== id);
-    const relations = (memoryStore.relations || []).filter((relation) => relation.from !== id && relation.to !== id);
-    const accepted = memories.length !== before;
-    const action = makeAction("delete_memory", id, { hard: true }, accepted, accepted ? "memory deleted" : "memory not found");
-    return {
-      memoryStore: refreshMemoryStore({
-        ...memoryStore,
-        memories,
-        relations,
-        actions: [...(memoryStore.actions || []), action],
-      }),
-      action,
-    };
+function detectCognitiveDimensions(text, concepts) {
+  const haystack = `${normalize(text).toLowerCase()} ${concepts.join(" ")}`;
+  return Object.entries(COGNITIVE_DIMENSIONS)
+    .filter(([, terms]) => terms.some((term) => hasPhrase(haystack, term)))
+    .map(([dimension]) => dimension);
+}
+
+function collectRecordText(record) {
+  const parts = [
+    record.source_label,
+    record.evidence?.title,
+    record.evidence?.text_excerpt,
+    ...(record.canonical_themes ?? []),
+  ];
+  (record.themes ?? []).forEach((theme) => {
+    parts.push(theme.label, ...(theme.evidence_terms ?? []));
+  });
+  return parts.filter(Boolean).join(" ");
+}
+
+function extractBigrams(tokens) {
+  const bigrams = [];
+  for (let index = 0; index < tokens.length - 1; index += 1) {
+    const left = tokens[index];
+    const right = tokens[index + 1];
+    if (LOW_SIGNAL_TERMS.has(left) || LOW_SIGNAL_TERMS.has(right)) continue;
+    bigrams.push(`${left} ${right}`);
   }
-  return forgetMemory(memoryId, memoryStore);
+  return bigrams;
 }
 
-export function retrieveMemories(query, memoryStore, options = {}) {
-  const top = Number(options.top ?? 8);
-  const minScore = Number(options.minScore ?? 0.12);
-  const memories = Array.isArray(memoryStore?.memories) ? memoryStore.memories : [];
-  return memories
-    .map((memory) => {
-      const lexical = overlapScore(query, memory);
-      const score = clamp((lexical * 0.56) + (Number(memory.strength || 0) * 0.34) + (isSchemaMemory(memory) ? 0.1 : 0));
+function tokenize(value) {
+  return normalize(value)
+    .toLowerCase()
+    .replace(/https?:\/\/\S+/g, " ")
+    .replace(/[^a-z0-9+#./-]+/g, " ")
+    .split(/\s+/)
+    .map((token) => token.replace(/^www\./, "").replace(/\.(com|org|net|io|ai)$/i, ""))
+    .filter((token) => token.length >= 3)
+    .filter((token) => !STOP_WORDS.has(token))
+    .filter((token) => !/^\d+$/.test(token));
+}
+
+function resolveSchemaState(metrics, thresholds) {
+  if (
+    metrics.support >= Math.max(thresholds.minSupport * 3, 8) &&
+    metrics.confidence >= 0.7 &&
+    metrics.activeDayCount >= 2
+  ) {
+    return "stable";
+  }
+  if (
+    metrics.support >= Math.max(thresholds.minSupport * 2, 5) ||
+    (metrics.confidence >= 0.56 && metrics.distinctSourceCount >= 2)
+  ) {
+    return "reinforced";
+  }
+  return "emerging";
+}
+
+function stateLabel(state) {
+  return state === "stable"
+    ? "Stable virtual schema"
+    : state === "reinforced"
+      ? "Reinforced virtual schema"
+      : "Emerging virtual schema";
+}
+
+function buildFormationBasis({ support, weightedSupport, distinctSourceCount, activeDayCount, concepts, cognitiveDimensions, cohesion }) {
+  return [
+    `${support} supporting meaning packets`,
+    `${weightedSupport.toFixed(2)} weighted support`,
+    `${distinctSourceCount} distinct source${distinctSourceCount === 1 ? "" : "s"}`,
+    `${activeDayCount} active day${activeDayCount === 1 ? "" : "s"}`,
+    `cohesion ${cohesion.toFixed(2)}`,
+    `concepts: ${concepts.slice(0, 6).join(", ")}`,
+    `dimensions: ${cognitiveDimensions.join(", ") || "concept-only"}`,
+  ].join("; ");
+}
+
+function countThemes(records) {
+  return records.reduce((counts, record) => {
+    (record.themes ?? []).forEach((theme) => {
+      counts[theme] = (counts[theme] ?? 0) + 1;
+    });
+    return counts;
+  }, {});
+}
+
+function countDistinctSources(records) {
+  const sources = new Set();
+  records.forEach((record) => {
+    (record.sources ?? []).forEach((source) => {
+      const key = source.url || source.domain || source.title;
+      if (key) sources.add(key);
+    });
+  });
+  return sources.size || (records.length ? 1 : 0);
+}
+
+function countActiveDays(records) {
+  const days = new Set();
+  records.forEach((record) => {
+    const value = record.started_at || record.ended_at;
+    const timestamp = Date.parse(value || "");
+    if (Number.isFinite(timestamp)) {
+      days.add(new Date(timestamp).toISOString().slice(0, 10));
+    }
+  });
+  return days.size || (records.length ? 1 : 0);
+}
+
+function repeatedTerms(values, minCount) {
+  return topTerms(values, 100).filter((term) => countValues(values).get(term) >= minCount);
+}
+
+function topTerms(values, limit = 8) {
+  return [...countValues(values).entries()]
+    .sort((left, right) => right[1] - left[1] || left[0].localeCompare(right[0]))
+    .slice(0, limit)
+    .map(([term]) => term);
+}
+
+function countValues(values) {
+  const counts = new Map();
+  (Array.isArray(values) ? values : []).forEach((value) => {
+    const key = normalize(value).toLowerCase();
+    if (!key || LOW_SIGNAL_TERMS.has(key)) return;
+    counts.set(key, (counts.get(key) || 0) + 1);
+  });
+  return counts;
+}
+
+function hasPhrase(text, phrase) {
+  const haystack = normalize(text).toLowerCase();
+  const needle = normalize(phrase).toLowerCase();
+  if (!haystack || !needle) return false;
+  if (/^[a-z0-9]+$/.test(needle)) {
+    return new RegExp(`(^|[^a-z0-9])${escapeRegExp(needle)}([^a-z0-9]|$)`, "i").test(haystack);
+  }
+  return haystack.includes(needle);
+}
+
+function escapeRegExp(value) {
+  return String(value).replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function normalize(value) {
+  return String(value || "").replace(/\s+/g, " ").trim();
+}
+
+function unique(values) {
+  return [...new Set((Array.isArray(values) ? values : []).map(normalize).filter(Boolean))];
+}
+
+function round(value) {
+  return Math.round((Number(value || 0) + Number.EPSILON) * 10000) / 10000;
+}
+
+function titleCase(value) {
+  return normalize(value)
+    .replace(/[_-]+/g, " ")
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function slug(value) {
+  return normalize(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-+|-+$/g, "") || "schema";
+}
+/**
+ * Executes a memory pruning pass by applying category-specific decay coefficients.
+ * Highly volatile categories (like news) decay rapidly, while stable schemas persist.
+ * * @param {Array} records - Array of induced schemas or memory packets to process.
+ * @returns {Array} The remaining active memories after decay and pruning.
+ */
+/**
+ * Executes a memory pruning pass by applying category-specific decay coefficients.
+ */
+export function decayMemories(records = []) { // ◄ MAKE SURE "export" IS HERE!
+  if (!Array.isArray(records)) return [];
+  
+  return records
+    .map(record => {
+      let recordCategory = record.category;
+      
+      if (!recordCategory || !(recordCategory in CATEGORY_DECAY_REGISTRY)) {
+        recordCategory = record.evidence?.category || inferRecordCategory(record);
+      }
+      
+      const coefficient = recordCategory in CATEGORY_DECAY_REGISTRY 
+        ? CATEGORY_DECAY_REGISTRY[recordCategory] 
+        : DEFAULT_DECAY_COEFFICIENT;
+      
+      const currentConfidence = Number(record.confidence ?? 0.5);
+      const decayedConfidence = round(Math.max(0, currentConfidence - coefficient));
+
       return {
-        ...memory,
-        retrieval_score: score,
-        retrieval_reason: lexical
-          ? "query overlap with retained memory"
-          : "high-strength retained memory",
+        ...record,
+        confidence: decayedConfidence,
+        decay_applied: coefficient,
+        last_pruned_at: new Date().toISOString()
       };
     })
-    .filter((memory) => memory.retrieval_score >= minScore)
-    .sort((left, right) => right.retrieval_score - left.retrieval_score || right.strength - left.strength)
-    .slice(0, top);
-}
-
-export function retrieveCognitiveSchemas(query, memoryStore, options = {}) {
-  return retrieveMemories(query, {
-    ...memoryStore,
-    memories: (memoryStore?.memories || []).filter(isSchemaMemory),
-  }, {
-    top: Number(options.top ?? 4),
-    minScore: Number(options.minScore ?? 0.12),
-  });
-}
-
-export function buildRagContext(query, memoryStore = {}, options = {}) {
-  const top = Number(options.top ?? DEFAULT_RAG_TOP);
-  const cognitiveSchemas = retrieveCognitiveSchemas(query, memoryStore, {
-    top: Number(options.schemaTop ?? Math.min(4, top)),
-    minScore: Number(options.schemaMinScore ?? 0.08),
-  });
-  const supportingMemories = retrieveMemories(query, memoryStore, {
-    top,
-    minScore: Number(options.minScore ?? 0.08),
-  }).filter((memory) => !cognitiveSchemas.some((schema) => schema.id === memory.id));
-  const sourceMap = new Map();
-  [...cognitiveSchemas, ...supportingMemories].forEach((memory) => {
-    (memory.sources || []).forEach((source) => {
-      const key = source.url || `${source.domain}|${source.title}`;
-      if (key && !sourceMap.has(key)) sourceMap.set(key, source);
-    });
-  });
-  const contextItems = [...cognitiveSchemas, ...supportingMemories].slice(0, top).map((memory, index) => ({
-    rank: index + 1,
-    id: memory.id,
-    type: memory.type,
-    label: memory.label,
-    summary: memory.summary,
-    strength: Number(memory.strength || 0),
-    retrieval_score: Number(memory.retrieval_score || 0),
-    core_interpretation: memory.core_interpretation || "",
-    action_tendency: memory.action_tendency || "",
-    themes: memory.themes || [],
-    evidence_packet_ids: memory.evidence_packet_ids || [],
-    source_count: (memory.sources || []).length,
-  }));
-  const contextIds = new Set(contextItems.map((item) => item.id));
-  const relationTrails = (memoryStore.relations || [])
-    .map(normalizeRelationInput)
-    .filter((relation) => contextIds.has(relation.from) || contextIds.has(relation.to))
-    .sort((left, right) => right.weight - left.weight || right.confidence - left.confidence)
-    .slice(0, 12);
-  const memoryLanes = buildMemoryLanes(contextItems, relationTrails);
-
-  return {
-    contract: "memact.rag_context",
-    version: "0.1.0",
-    generated_at: nowIso(),
-    query: normalize(query, 240),
-    policy: {
-      retrieval_first: true,
-      prefer_cognitive_schema_memory: true,
-      use_sources_as_evidence: true,
-      no_diagnosis: true,
-      no_causal_certainty: true,
-      cloud_payload_minimized: true,
-    },
-    retrieval_steps: [
-      "retrieve matching cognitive schema memories",
-      "attach supporting activity memories",
-      "attach memory relation trails",
-      "attach source evidence",
-    ],
-    memory_lanes: memoryLanes,
-    relation_trails: relationTrails,
-    cognitive_schema_memories: cognitiveSchemas,
-    supporting_memories: supportingMemories.slice(0, Math.max(0, top - cognitiveSchemas.length)),
-    context_items: contextItems,
-    sources: [...sourceMap.values()].slice(0, MAX_SOURCES),
-    stats: {
-      cognitive_schema_count: cognitiveSchemas.length,
-      supporting_memory_count: supportingMemories.length,
-      relation_trail_count: relationTrails.length,
-      source_count: sourceMap.size,
-    },
-  };
-}
-
-function buildMemoryLanes(contextItems = [], relationTrails = []) {
-  const lanes = {
-    cognitive_schema: [],
-    activity: [],
-    evidence_source: [],
-    relation: [],
-  };
-  for (const item of contextItems) {
-    const lane = item.type === "cognitive_schema_memory" || item.type === "schema_memory" ? "cognitive_schema" : "activity";
-    lanes[lane].push({
-      id: item.id,
-      label: item.label,
-      strength: item.strength,
-      retrieval_score: item.retrieval_score,
-    });
-  }
-  for (const relation of relationTrails) {
-    lanes.relation.push({
-      id: relation.id,
-      type: relation.type,
-      from: relation.from,
-      to: relation.to,
-      weight: relation.weight,
-    });
-  }
-  return lanes;
-}
-
-export function rememberPacket(packet, memoryStore = {}, options = {}) {
-  const memory = activityMemoryFromRecord(packet, options);
-  if (!memory) {
-    return {
-      memoryStore,
-      action: makeAction("remember_packet", "", { packet_id: packet?.packet_id || packet?.id }, false, "packet did not pass retention threshold"),
-    };
-  }
-  const next = buildMemoryStore({
-    inference: { records: [packet], schema_version: "memact.inference.v0" },
-    schema: { schemas: [], schema_version: "memact.schema.v0" },
-    previousMemory: memoryStore,
-    options,
-  });
-  const action = makeAction("remember_packet", memory.id, { packet_id: memory.source_packet_id }, true, "packet retained");
-  next.actions = [...(next.actions || []), action];
-  return { memoryStore: next, action };
-}
-
-export function rememberInferenceRecord(record, memoryStore = {}, options = {}) {
-  return rememberPacket(record, memoryStore, options)
-}
-
-export function rememberSchemaPacket(packet, memoryStore = {}) {
-  if (packet?.schema_type === "reading_preferences" || packet?.category === "reading") {
-    const attributes = packet.attributes && typeof packet.attributes === "object" ? packet.attributes : {}
-    return createMemory({
-      id: `memory:reading:${slug(packet.packet_id || packet.id || "reading_preferences")}`,
-      type: "reading_preference_memory",
-      label: "Reading preferences",
-      summary: summarizeReadingPreferences(attributes),
-      strength: clamp(packet.confidence ?? 0.62),
-      confidence: clamp(packet.confidence ?? 0.62),
-      category: "reading",
-      schema_id: "reading_preferences",
-      schema_packet_id: normalize(packet.packet_id || packet.id),
-      schema_refs: ["reading_preferences"],
-      evidence_refs: unique((packet.sources || []).map((source) => source.id || source.source_id || source.url || source.title)),
-      feature_refs: ["adaptive-article-overview"],
-      attributes,
-      themes: unique(["reading", ...(attributes.preferred_topics || []), ...(attributes.repeat_topics || [])]),
-      sources: packet.sources || [],
-      reasons: ["reading preference schema retained"],
-      provenance: { system: "schema", claim_type: "reading_preference_memory" },
-      state: "active"
-    }, memoryStore)
-  }
-  return rememberSchema(packet, memoryStore)
-}
-
-export function rememberFeatureOutput(output = {}, memoryStore = {}) {
-  const featureId = normalize(output.feature_id || output.featureId || "feature", 120)
-  const memory = normalizeMemoryInput({
-    id: `memory:feature:${slug(`${featureId}_${Date.now()}`)}`,
-    type: "feature_output_memory",
-    label: normalize(output.name || featureId, 160),
-    summary: normalize(output.summary || JSON.stringify(output.output || {}).slice(0, 300), 360),
-    strength: clamp(output.confidence ?? 0.6),
-    feature_id: featureId,
-    feature_refs: [featureId],
-    provenance: { system: "playground", claim_type: "feature_output" },
-    state: "active",
-  })
-  return createMemory(memory, memoryStore)
-}
-
-export function listMemoryRecords(filter = {}, memoryStore = {}) {
-  return (memoryStore.memories || []).filter((memory) => {
-    if (filter.type && memory.type !== filter.type) return false
-    if (filter.state && memory.state !== filter.state) return false
-    return true
-  })
-}
-
-export function retrieveContext(query, memoryStore = {}, options = {}) {
-  return buildRagContext(query, memoryStore, options)
-}
-
-export function retrieveSchemaPackets(filter = {}, memoryStore = {}) {
-  return listMemoryRecords({ ...filter, type: filter.type || "cognitive_schema_memory" }, memoryStore)
-}
-
-export function createCorrection(memoryId, correction = {}, memoryStore = {}) {
-  const action = makeAction("correction_record", memoryId, correction, true, "user correction recorded")
-  return applyMemoryAction(memoryStore, action, (memory) => ({
-    ...memory,
-    corrections: [...(memory.corrections || []), { ...correction, created_at: nowIso() }],
-    strength: clamp(Number(memory.strength || 0) + 0.02),
-  }))
-}
-
-export function buildContextForFeature(featureId, memoryStore = {}, options = {}) {
-  if (featureId === "adaptive-article-overview") {
-    return {
-      feature_id: featureId,
-      reading_memory: buildReadingMemorySummary(memoryStore),
-      context: retrieveContext(options.query || "reading preferences", memoryStore, options),
-      schema_packets: retrieveSchemaPackets({ category: "reading" }, memoryStore),
-    }
-  }
-  return {
-    feature_id: normalize(featureId),
-    context: retrieveContext(options.query || featureId, memoryStore, options),
-    schema_packets: retrieveSchemaPackets({}, memoryStore),
-  }
-}
-
-function summarizeReadingPreferences(attributes = {}) {
-  const parts = []
-  if (attributes.preferred_topics?.length) parts.push(`preferred topics: ${attributes.preferred_topics.join(", ")}`)
-  if (attributes.skipped_topics?.length) parts.push(`skipped topics: ${attributes.skipped_topics.join(", ")}`)
-  if (attributes.preferred_summary_style && attributes.preferred_summary_style !== "unknown") parts.push(`summary style: ${attributes.preferred_summary_style}`)
-  if (attributes.preferred_article_length && attributes.preferred_article_length !== "unknown") parts.push(`article length: ${attributes.preferred_article_length}`)
-  return parts.length ? parts.join("; ") : "Reading preference memory from approved article activity."
-}
-
-function buildReadingMemorySummary(memoryStore = {}) {
-  const memories = (memoryStore.memories || []).filter((memory) => memory.type === "reading_preference_memory")
-  const attributes = Object.assign({}, ...memories.map((memory) => memory.attributes || {}))
-  return {
-    average_read_time_seconds: Number(attributes.average_read_time_seconds || 0),
-    average_scroll_depth: Number(attributes.average_scroll_depth || 0),
-    finish_rate: Number(attributes.finish_rate || 0),
-    preferred_topics: unique(attributes.preferred_topics || []),
-    skipped_topics: unique(attributes.skipped_topics || []),
-    preferred_article_length: normalize(attributes.preferred_article_length || "unknown"),
-    preferred_summary_style: normalize(attributes.preferred_summary_style || "unknown"),
-    repeat_topics: unique(attributes.repeat_topics || [])
-  }
-}
-
-export function rememberSchema(schemaPacket, memoryStore = {}) {
-  const memory = schemaMemoryFromSchema(schemaPacket);
-  if (!memory) {
-    return {
-      memoryStore,
-      action: makeAction("remember_schema", "", { schema_id: schemaPacket?.id }, false, "schema packet missing id"),
-    };
-  }
-  const next = buildMemoryStore({
-    inference: { records: [], schema_version: "memact.inference.v0" },
-    schema: { schemas: [schemaPacket], schema_version: "memact.schema.v0" },
-    previousMemory: memoryStore,
-  });
-  const action = makeAction("remember_schema", memory.id, { schema_id: memory.schema_id }, true, "schema retained");
-  next.actions = [...(next.actions || []), action];
-  return { memoryStore: next, action };
-}
-
-export function rememberIntent(intentResult, memoryStore = {}) {
-  const memories = intentMemoriesFromResult(intentResult);
-  if (!memories.length) {
-    return {
-      memoryStore,
-      action: makeAction("remember_intent", "", {}, false, "intent result did not include predicted intents"),
-    };
-  }
-  const next = buildMemoryStore({
-    inference: { records: [], schema_version: "memact.inference.v0" },
-    schema: { schemas: [], schema_version: "memact.schema.v0" },
-    intent: intentResult,
-    previousMemory: memoryStore,
-  });
-  const action = makeAction("remember_intent", memories[0].id, { intent_count: memories.length }, true, "intent retained");
-  next.actions = [...(next.actions || []), action];
-  return { memoryStore: next, memories, action };
-}
-
-export function retrieveIntents(query, memoryStore = {}, options = {}) {
-  return retrieveMemories(query, {
-    ...memoryStore,
-    memories: (memoryStore?.memories || []).filter(isIntentMemory),
-  }, {
-    top: Number(options.top ?? 4),
-    minScore: Number(options.minScore ?? 0.08),
-  });
-}
-
-export function linkIntentToSchema(intentId, schemaId, memoryStore = {}) {
-  return relateMemories(intentId, schemaId, MEMORY_RELATION_TYPES.BUILDS_ON, {
-    reason: "intent hypothesis used schema context",
-  }, memoryStore);
-}
-
-export function linkIntentToEvidence(intentId, evidenceId, memoryStore = {}) {
-  return addRelation(memoryStore, {
-    from: intentId,
-    to: evidenceId,
-    type: MEMORY_RELATION_TYPES.EVIDENCED_BY,
-    evidence: { reason: "intent hypothesis cites approved evidence" },
-  }, makeAction("link_intent_to_evidence", intentId, { evidence_id: normalize(evidenceId) }, true, "intent linked to evidence"));
-}
-
-export function reinforceMemory(memoryId, evidence = {}, memoryStore = {}) {
-  const action = makeAction("reinforce_memory", memoryId, evidence, true, "memory reinforced by evidence");
-  const result = applyMemoryAction(memoryStore, action, (memory) => ({
-    ...memory,
-    strength: clamp(Number(memory.strength || 0) + 0.08),
-    survival_score: clamp(Number(memory.survival_score || 0) + 0.08),
-    sources: dedupeSources([...(memory.sources || []), ...(evidence.sources || [])]),
-  }));
-  if (!result.action.accepted) return result;
-  return addRelation(result.memoryStore, {
-    from: memoryId,
-    to: evidence.memory_id || evidence.source_memory_id || memoryId,
-    type: MEMORY_RELATION_TYPES.REINFORCES,
-    evidence,
-  }, action);
-}
-
-export function weakenMemory(memoryId, reason = "", memoryStore = {}) {
-  const action = makeAction("weaken_memory", memoryId, { reason: normalize(reason) }, true, "memory weakened");
-  return applyMemoryAction(memoryStore, action, (memory) => ({
-    ...memory,
-    strength: clamp(Number(memory.strength || 0) - 0.12),
-    state: Number(memory.strength || 0) <= 0.16 ? "weak" : memory.state,
-  }));
-}
-
-export function forgetMemory(memoryId, memoryStore = {}) {
-  const action = makeAction("forget_memory", memoryId, {}, true, "memory forgotten");
-  return applyMemoryAction(memoryStore, action, (memory) => ({
-    ...memory,
-    strength: 0,
-    state: "forgotten",
-  }));
-}
-
-export function linkMemories(fromId, toId, memoryStore = {}, relation = "related") {
-  return relateMemories(fromId, toId, relation, {}, memoryStore).memoryStore;
-}
-
-export function relateMemories(fromId, toId, relation = MEMORY_RELATION_TYPES.RELATED, evidence = {}, memoryStore = {}) {
-  const from = normalize(fromId);
-  const to = normalize(toId);
-  const type = normalizeRelationType(relation);
-  const memories = memoryStore.memories || [];
-  const exists = memories.some((memory) => memory.id === from) && memories.some((memory) => memory.id === to);
-  const action = makeAction("relate_memories", from, { to, relation: type }, exists, exists ? "memories related" : "both memories must exist before linking");
-  if (!exists) return { memoryStore: emptyMemoryStore(memoryStore), relation: null, action };
-  return addRelation(memoryStore, { from, to, type, evidence }, action);
-}
-
-export function assimilateEvidence(memoryId, evidence = {}, memoryStore = {}) {
-  const packetIds = unique(evidence.packet_ids || evidence.evidence_packet_ids || (evidence.packet_id ? [evidence.packet_id] : []));
-  const action = makeAction("assimilate_evidence", memoryId, {
-    packet_ids: packetIds,
-    source_count: Array.isArray(evidence.sources) ? evidence.sources.length : 0,
-  }, true, "evidence assimilated into memory");
-  const result = applyMemoryAction(memoryStore, action, (memory) => ({
-    ...memory,
-    strength: clamp(Number(memory.strength || 0) + 0.06 + Math.min(0.08, packetIds.length * 0.015)),
-    survival_score: clamp(Number(memory.survival_score || 0) + 0.05),
-    support: Number(memory.support || 0) + Math.max(1, packetIds.length),
-    evidence_packet_ids: unique([...(memory.evidence_packet_ids || []), ...packetIds]),
-    sources: dedupeSources([...(memory.sources || []), ...(evidence.sources || [])]),
-    themes: unique([...(memory.themes || []), ...(evidence.themes || [])]),
-    reasons: unique([...(memory.reasons || []), normalize(evidence.reason || "new evidence matched this schema")]),
-    last_seen_at: normalize(evidence.occurred_at || nowIso(), 80),
-    schema_state: memory.schema_state || "assimilating",
-  }));
-  if (!result.action.accepted) return result;
-  return addRelation(result.memoryStore, {
-    from: memoryId,
-    to: evidence.source_memory_id || memoryId,
-    type: MEMORY_RELATION_TYPES.ASSIMILATES,
-    evidence: { ...evidence, packet_ids: packetIds },
-  }, action);
-}
-
-export function accommodateSchema(memoryInput, evidence = {}, memoryStore = {}) {
-  const schemaMemory = normalizeMemoryInput({
-    ...memoryInput,
-    type: "cognitive_schema_memory",
-    virtual: true,
-    cognitive_schema: true,
-    state: memoryInput.state || "active",
-    schema_state: memoryInput.schema_state || "accommodated",
-    provenance: {
-      system: "memory",
-      claim_type: "accommodated_cognitive_schema",
-      ...(memoryInput.provenance || {}),
-    },
-    evidence_packet_ids: unique(memoryInput.evidence_packet_ids || evidence.packet_ids || evidence.evidence_packet_ids),
-    sources: dedupeSources([...(memoryInput.sources || []), ...(evidence.sources || [])]),
-    reasons: unique([...(memoryInput.reasons || []), evidence.reason || "new evidence needed a separate schema"]),
-  });
-  const created = createMemory(schemaMemory, memoryStore);
-  if (!created.action.accepted) return created;
-  const action = makeAction("accommodate_schema", schemaMemory.id, { reason: normalize(evidence.reason, 240) }, true, "new schema accommodated");
-  const next = refreshMemoryStore({
-    ...created.memoryStore,
-    actions: [...(created.memoryStore.actions || []), action],
-  });
-  return addRelation(next, {
-    from: schemaMemory.id,
-    to: evidence.source_memory_id || schemaMemory.id,
-    type: MEMORY_RELATION_TYPES.ACCOMMODATES,
-    evidence,
-  }, action);
-}
-
-export function supersedeMemory(memoryId, replacementInput = {}, reason = "", memoryStore = {}) {
-  const previous = readMemory(memoryId, memoryStore);
-  if (!previous) {
-    const action = makeAction("supersede_memory", memoryId, {}, false, "memory not found");
-    return { memoryStore: emptyMemoryStore(memoryStore), memory: null, replaced: null, action };
-  }
-  const replacement = normalizeMemoryInput({
-    ...previous,
-    ...replacementInput,
-    id: replacementInput.id || `${previous.id}:v${Date.now()}`,
-    supersedes: unique([...(replacementInput.supersedes || []), previous.id]),
-    reasons: unique([...(previous.reasons || []), ...(replacementInput.reasons || []), reason || "memory updated by newer evidence"]),
-    strength: clamp(Math.max(previous.strength || 0, replacementInput.strength ?? previous.strength ?? 0) + 0.04),
-    first_seen_at: replacementInput.first_seen_at || previous.first_seen_at,
-    last_seen_at: replacementInput.last_seen_at || nowIso(),
-    state: replacementInput.state || "active",
-  });
-  const memories = (memoryStore.memories || []).map((memory) => (
-    memory.id === previous.id
-      ? {
-        ...memory,
-        state: "superseded",
-        superseded_by: replacement.id,
-        valid_until: nowIso(),
-        strength: clamp(Number(memory.strength || 0) - 0.18),
-      }
-      : memory
-  ));
-  const action = makeAction("supersede_memory", previous.id, { replacement_id: replacement.id, reason: normalize(reason) }, true, "memory superseded");
-  const next = refreshMemoryStore({
-    ...memoryStore,
-    memories: [...memories, replacement],
-    actions: [...(memoryStore.actions || []), action],
-  });
-  const withForward = addRelation(next, {
-    from: replacement.id,
-    to: previous.id,
-    type: MEMORY_RELATION_TYPES.SUPERSEDES,
-    evidence: { reason },
-  }, action);
-  const withReverse = addRelation(withForward.memoryStore, {
-    from: previous.id,
-    to: replacement.id,
-    type: MEMORY_RELATION_TYPES.SUPERSEDED_BY,
-    evidence: { reason },
-  }, action);
-  return {
-    memoryStore: withReverse.memoryStore,
-    memory: replacement,
-    replaced: previous,
-    action,
-  };
-}
-
-export function getMemoryTimeline(memoryStore = {}, options = {}) {
-  const limit = Number(options.limit ?? 50);
-  const memoryEvents = (memoryStore.memories || []).flatMap((memory) => [
-    memory.first_seen_at ? { type: "first_seen", memory_id: memory.id, label: memory.label, occurred_at: memory.first_seen_at } : null,
-    memory.last_seen_at ? { type: "last_seen", memory_id: memory.id, label: memory.label, occurred_at: memory.last_seen_at } : null,
-  ]).filter(Boolean);
-  const actionEvents = (memoryStore.actions || []).map((action) => ({
-    type: action.type,
-    memory_id: action.memory_id,
-    label: action.reason,
-    occurred_at: action.occurred_at,
-    accepted: action.accepted,
-  }));
-  const relationEvents = (memoryStore.relations || []).map((relation) => ({
-    type: `relation:${relation.type}`,
-    memory_id: relation.from,
-    target_id: relation.to,
-    label: relation.evidence?.reason || relation.type,
-    occurred_at: relation.recorded_at || relation.valid_from,
-  }));
-  return [...memoryEvents, ...actionEvents, ...relationEvents]
-    .sort((left, right) => parseTime(right.occurred_at) - parseTime(left.occurred_at))
-    .slice(0, limit);
-}
-
-export function queryMemoryGraph(query, memoryStore = {}, options = {}) {
-  const top = Number(options.top ?? 6);
-  const retrieved = retrieveMemories(query, memoryStore, { top, minScore: options.minScore ?? 0.08 });
-  const ids = new Set(retrieved.map((memory) => memory.id));
-  const relationTrails = (memoryStore.relations || [])
-    .map(normalizeRelationInput)
-    .filter((relation) => ids.has(relation.from) || ids.has(relation.to))
-    .sort((left, right) => right.weight - left.weight)
-    .slice(0, Number(options.relationTop ?? 12));
-  return {
-    query: normalize(query, 240),
-    memories: retrieved,
-    relation_trails: relationTrails,
-    timeline: getMemoryTimeline(memoryStore, { limit: Number(options.timelineLimit ?? 12) }),
-  };
-}
-
-function addRelation(memoryStore = {}, relationInput = {}, action = null) {
-  const relation = normalizeRelationInput(relationInput);
-  if (!relation.from || !relation.to) {
-    const rejected = action ? { ...action, accepted: false, reason: "relation missing endpoints" } : makeAction("relate_memories", relation.from, relation, false, "relation missing endpoints");
-    return { memoryStore: emptyMemoryStore(memoryStore), relation: null, action: rejected };
-  }
-  const relations = [...(memoryStore.relations || []).filter((item) => item.id !== relation.id), relation];
-  const next = refreshMemoryStore({
-    ...memoryStore,
-    relations,
-    actions: action && !(memoryStore.actions || []).some((item) => item.id === action.id)
-      ? [...(memoryStore.actions || []), action]
-      : (memoryStore.actions || []),
-  });
-  return { memoryStore: next, relation, action: action || makeAction("relate_memories", relation.from, relation, true, "memories related") };
-}
-
-export function explainMemory(memoryId, memoryStore = {}) {
-  const memory = (memoryStore.memories || []).find((item) => item.id === memoryId);
-  if (!memory) {
-    return null;
-  }
-  return {
-    id: memory.id,
-    type: memory.type,
-    label: memory.label,
-    summary: memory.summary,
-    strength: memory.strength,
-    themes: memory.themes || [],
-    sources: memory.sources || [],
-    provenance: memory.provenance,
-    explanation: `${memory.label} survived because ${formatReasons(memory)}.`,
-  };
-}
-
-export function getMemoryGraph(memoryStore = {}) {
-  return memoryStore.graph || buildMemoryGraph(memoryStore.memories || []);
-}
-
-export function formatMemoryReport(memoryStore = {}) {
-  const lines = [
-    "Memact Memory Report",
-    `Memories: ${memoryStore.stats?.memoryCount || 0}`,
-    `Activity memories: ${memoryStore.stats?.activityMemoryCount || 0}`,
-    `Cognitive schema memories: ${memoryStore.stats?.schemaMemoryCount || 0}`,
-    `Intent memories: ${memoryStore.stats?.intentMemoryCount || 0}`,
-    "",
-    "Strongest Memories",
-  ];
-
-  const memories = Array.isArray(memoryStore.memories) ? memoryStore.memories : [];
-  if (!memories.length) {
-    lines.push("No memories met the survival threshold.");
-    return lines.join("\n");
-  }
-
-  memories.slice(0, 10).forEach((memory, index) => {
-    lines.push(`${index + 1}. ${memory.label}`);
-    lines.push(`   type=${memory.type} strength=${Number(memory.strength || 0).toFixed(3)} themes=${(memory.themes || []).join(", ") || "none"}`);
-    lines.push(`   why=${formatReasons(memory)}`);
-  });
-
-  return lines.join("\n");
-}
-
-function applyMemoryAction(memoryStore, action, mutate) {
-  let matched = false;
-  const memories = (memoryStore.memories || []).map((memory) => {
-    if (memory.id !== action.memory_id) return memory;
-    matched = true;
-    return mutate(memory);
-  });
-  const finalAction = matched ? action : { ...action, accepted: false, reason: "memory not found" };
-  const next = {
-    ...memoryStore,
-    memories,
-    activity_memories: memories.filter((memory) => memory.type === "activity_memory"),
-    intent_memories: memories.filter(isIntentMemory),
-    schema_packets: memories.filter(isSchemaMemory),
-    cognitive_schema_memories: memories.filter(isSchemaMemory),
-    graph: buildMemoryGraph(memories, memoryStore.relations || []),
-    relations: memoryStore.relations || [],
-    actions: [...(memoryStore.actions || []), finalAction],
-    stats: {
-      ...(memoryStore.stats || {}),
-      memoryCount: memories.length,
-      activityMemoryCount: memories.filter((memory) => memory.type === "activity_memory").length,
-      intentMemoryCount: memories.filter(isIntentMemory).length,
-      schemaMemoryCount: memories.filter(isSchemaMemory).length,
-    },
-  };
-  return { memoryStore: next, action: finalAction };
-}
-
-function formatReasons(memory) {
-  const reasons = unique([
-    ...(memory.reasons || []),
-    isSchemaMemory(memory) && memory.core_interpretation ? `frame: ${memory.core_interpretation}` : "",
-    isSchemaMemory(memory) ? `${memory.support || 0} supporting packets` : "",
-    isIntentMemory(memory) && memory.confidence_level ? `intent confidence: ${memory.confidence_level}` : "",
-    memory.sources?.length ? `${memory.sources.length} source${memory.sources.length === 1 ? "" : "s"}` : "",
-  ]);
-  return reasons.length ? reasons.join(", ") : "it has retained evidence";
-}
-
-function isSchemaMemory(memory) {
-  return memory?.type === "cognitive_schema_memory" || memory?.type === "schema_memory";
-}
-
-function isIntentMemory(memory) {
-  return memory?.type === "intent_memory";
+    .filter(record => record.confidence >= DECAY_ELIMINATION_THRESHOLD);
 }
