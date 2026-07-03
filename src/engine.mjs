@@ -1502,3 +1502,27 @@ function isSchemaMemory(memory) {
 function isIntentMemory(memory) {
   return memory?.type === "intent_memory";
 }
+/**
+ * Automatically evaluates memory records and filters out any temporary 
+ * travel health context or requirements that have passed their self-destruct timestamp.
+ * * @param {Array<Object>} records - Array of memory objects to evaluate
+ * @returns {Array<Object>} Filtered array containing only non-expired records
+ */
+export function purgeExpiredRecords(records = []) {
+  if (!Array.isArray(records)) return [];
+  
+  const currentTime = Date.now();
+  
+  return records.filter(record => {
+    // Check if the record has an expiration or self-destruct timestamp
+    const expirationTime = record.selfDestructAt || record.expiresAt;
+    
+    if (expirationTime) {
+      // If the current time has reached or passed expiration, drop the record (return false)
+      return currentTime < new Date(expirationTime).getTime();
+    }
+    
+    // Keep records that don't have an expiration attribute
+    return true;
+  });
+}
