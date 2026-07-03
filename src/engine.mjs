@@ -1502,3 +1502,129 @@ function isSchemaMemory(memory) {
 function isIntentMemory(memory) {
   return memory?.type === "intent_memory";
 }
+// Stores historical genre weights to maintain a running baseline profile
+let USER_MEDIA_BASELINE = new Map(); 
+const BASELINE_DECAY = 0.95; // Keeps baseline adaptable but stable
+const ANOMALY_THRESHOLD = 0.70; // Sensitivity limit for structural signature shifts
+
+/**
+ * Updates the user's core media baseline with normal playback patterns.
+ * @param {Array<string>} genres 
+ */
+export function trainMediaBaseline(genres = []) {
+  // Decay old weights to let the baseline adapt smoothly over time
+  for (const [genre, weight] of USER_MEDIA_BASELINE.entries()) {
+    USER_MEDIA_BASELINE.set(genre, weight * BASELINE_DECAY);
+  }
+  // Add new signals
+  genres.forEach(genre => {
+    const normalized = genre.toLowerCase().trim();
+    USER_MEDIA_BASELINE.set(normalized, (USER_MEDIA_BASELINE.get(normalized) || 0) + 1.0);
+  });
+}
+
+/**
+ * Detects structural changes in playback content streams and returns 
+ * the target isolation partition ('shared-session' or 'default').
+ * * @param {Object} playbackEvent - { title, artist, genres: ['pop', 'rock'] }
+ * @returns {string} Target memory partition assignment
+ */
+export function detectSessionAnomaly(playbackEvent = {}) {
+  const incomingGenres = playbackEvent.genres || [];
+  if (incomingGenres.length === 0 || USER_MEDIA_BASELINE.size === 0) {
+    return "default"; // Default path if no baseline or incoming tracking metrics exist
+  }
+
+  let matchScore = 0;
+  let totalIncomingWeight = incomingGenres.length;
+
+  // Calculate alignment score against user's established historical tastes
+  incomingGenres.forEach(genre => {
+    const normalized = genre.toLowerCase().trim();
+    if (USER_MEDIA_BASELINE.has(normalized)) {
+      // Scale matching score based on how strong that genre is in baseline history
+      matchScore += Math.min(USER_MEDIA_BASELINE.get(normalized), 1.0);
+    }
+  });
+
+  const alignmentRatio = matchScore / totalIncomingWeight;
+
+  // An anomaly is triggered if the similarity falls drastically below our threshold
+  if (alignmentRatio < (1 - ANOMALY_THRESHOLD)) {
+    return "shared-session"; // Isolate under quarantined partition flag
+  }
+
+  return "default";
+}
+
+/**
+ * Resets the in-memory media baseline profile between test sweeps.
+ */
+export function clearMediaBaseline() {
+  USER_MEDIA_BASELINE.clear();
+
+/**
+ * Automatically evaluates memory records and filters out any temporary 
+ * travel health context or requirements that have passed their self-destruct timestamp.
+ * * @param {Array<Object>} records - Array of memory objects to evaluate
+ * @returns {Array<Object>} Filtered array containing only non-expired records
+ */
+export function purgeExpiredRecords(records = []) {
+  if (!Array.isArray(records)) return [];
+  
+  const currentTime = Date.now();
+  
+  return records.filter(record => {
+    // Check if the record has an expiration or self-destruct timestamp
+    const expirationTime = record.selfDestructAt || record.expiresAt;
+    
+    if (expirationTime) {
+      // If the current time has reached or passed expiration, drop the record (return false)
+      return currentTime < new Date(expirationTime).getTime();
+    }
+    
+    // Keep records that don't have an expiration attribute
+    return true;
+  });
+
+
+// Append-only commit log storage array
+let COMMIT_JOURNAL_LOG = [];
+
+// Maximum number of entries to retain before triggering rotation truncation
+const MAX_LOG_THRESHOLD = 50;
+
+/**
+ * Appends an entry to the journal log and automatically truncates old rows
+ * if the total length violates our maximum boundary size.
+ * * @param {Object|string} entry - The log event metadata or text string to commit
+ * @returns {Array<Object|string>} The updated, bounded journal log array
+ */
+export function appendCommitLog(entry) {
+  if (entry === undefined || entry === null) return COMMIT_JOURNAL_LOG;
+
+  // Append new log entry to the end of our journal track
+  COMMIT_JOURNAL_LOG.push(entry);
+
+  // If the log exceeds bounds, truncate older rows out of the array
+  if (COMMIT_JOURNAL_LOG.length > MAX_LOG_THRESHOLD) {
+    COMMIT_JOURNAL_LOG = COMMIT_JOURNAL_LOG.slice(-MAX_LOG_THRESHOLD);
+  }
+
+  return COMMIT_JOURNAL_LOG;
+}
+
+/**
+ * Retrieves the current state of the commit journal log array.
+ * @returns {Array<Object|string>}
+ */
+export function getCommitJournal() {
+  return COMMIT_JOURNAL_LOG;
+}
+
+/**
+ * Resets the journal log state between validation sweeps.
+ */
+export function clearCommitJournal() {
+  COMMIT_JOURNAL_LOG = [];
+}
