@@ -96,3 +96,49 @@ export function claimsForEvidence(evidenceId, claims = []) {
       claim.contradicted_by_evidence_ids.includes(id)
     );
 }
+// Allowed action origins for trace logging
+export const RECTIFICATION_ORIGINS = Object.freeze({
+  MANUAL: "manual",
+  AUTO_COMPACTION: "auto_compaction",
+  APP_OVERWRITE: "app_overwrite"
+});
+
+/**
+ * Rectifies an existing context claim and attaches a historical trace log 
+ * detailing the action origin reason.
+ * 
+ * @param {Object} existingClaim - The original claim object
+ * @param {Object} updates - The new fields to apply to the claim
+ * @param {string} origin - Why it was rectified ('manual', 'auto_compaction', 'app_overwrite')
+ * @returns {Object} The updated claim object with complete rectification trace metadata
+ */
+export function rectifyClaimWithTrace(existingClaim = {}, updates = {}, origin) {
+  const verifiedOrigin = String(origin || "").toLowerCase().trim();
+  
+  // Validate that the provided origin is one of our strict allowed tracking channels
+  const allowedOrigins = Object.values(RECTIFICATION_ORIGINS);
+  if (!allowedOrigins.includes(verifiedOrigin)) {
+    throw new Error(`Invalid rectification origin: '${origin}'. Must be one of: ${allowedOrigins.join(', ')}`);
+  }
+
+  // Build the historical trace log entry
+  const traceEntry = {
+    timestamp: new Date().toISOString(),
+    action_origin: verifiedOrigin,
+    previous_state: { ...existingClaim.metadata, text: existingClaim.text }
+  };
+
+  // Compile the new claim state with the injected trace array
+  return {
+    ...existingClaim,
+    ...updates,
+    metadata: {
+      ...(existingClaim.metadata || {}),
+      ...(updates.metadata || {}),
+      rectification_trace: [
+        ...(existingClaim.metadata?.rectification_trace || []),
+        traceEntry
+      ]
+    }
+  };
+}
