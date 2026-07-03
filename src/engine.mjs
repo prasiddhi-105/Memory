@@ -1502,3 +1502,64 @@ function isSchemaMemory(memory) {
 function isIntentMemory(memory) {
   return memory?.type === "intent_memory";
 }
+// Stores historical genre weights to maintain a running baseline profile
+let USER_MEDIA_BASELINE = new Map(); 
+const BASELINE_DECAY = 0.95; // Keeps baseline adaptable but stable
+const ANOMALY_THRESHOLD = 0.70; // Sensitivity limit for structural signature shifts
+
+/**
+ * Updates the user's core media baseline with normal playback patterns.
+ * @param {Array<string>} genres 
+ */
+export function trainMediaBaseline(genres = []) {
+  // Decay old weights to let the baseline adapt smoothly over time
+  for (const [genre, weight] of USER_MEDIA_BASELINE.entries()) {
+    USER_MEDIA_BASELINE.set(genre, weight * BASELINE_DECAY);
+  }
+  // Add new signals
+  genres.forEach(genre => {
+    const normalized = genre.toLowerCase().trim();
+    USER_MEDIA_BASELINE.set(normalized, (USER_MEDIA_BASELINE.get(normalized) || 0) + 1.0);
+  });
+}
+
+/**
+ * Detects structural changes in playback content streams and returns 
+ * the target isolation partition ('shared-session' or 'default').
+ * * @param {Object} playbackEvent - { title, artist, genres: ['pop', 'rock'] }
+ * @returns {string} Target memory partition assignment
+ */
+export function detectSessionAnomaly(playbackEvent = {}) {
+  const incomingGenres = playbackEvent.genres || [];
+  if (incomingGenres.length === 0 || USER_MEDIA_BASELINE.size === 0) {
+    return "default"; // Default path if no baseline or incoming tracking metrics exist
+  }
+
+  let matchScore = 0;
+  let totalIncomingWeight = incomingGenres.length;
+
+  // Calculate alignment score against user's established historical tastes
+  incomingGenres.forEach(genre => {
+    const normalized = genre.toLowerCase().trim();
+    if (USER_MEDIA_BASELINE.has(normalized)) {
+      // Scale matching score based on how strong that genre is in baseline history
+      matchScore += Math.min(USER_MEDIA_BASELINE.get(normalized), 1.0);
+    }
+  });
+
+  const alignmentRatio = matchScore / totalIncomingWeight;
+
+  // An anomaly is triggered if the similarity falls drastically below our threshold
+  if (alignmentRatio < (1 - ANOMALY_THRESHOLD)) {
+    return "shared-session"; // Isolate under quarantined partition flag
+  }
+
+  return "default";
+}
+
+/**
+ * Resets the in-memory media baseline profile between test sweeps.
+ */
+export function clearMediaBaseline() {
+  USER_MEDIA_BASELINE.clear();
+}
